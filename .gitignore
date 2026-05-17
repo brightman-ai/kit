@@ -1,0 +1,19 @@
+# Build outputs
+*.exe
+*.test
+*.out
+
+# Environment & secrets
+.env
+.env.*
+*.key
+*.pem
+credentials.*
+
+# Docs (workflow_ng private artifacts — stored in deepwork-pro/docs via symlink)
+docs/
+
+# Editor
+.DS_Store
+.idea/
+.vscode/
