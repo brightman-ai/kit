@@ -43,6 +43,14 @@ type State struct {
 	TotalBytes      int64  `json:"totalBytes,omitempty"` // -1 if unknown
 	DownloadURL     string `json:"downloadURL,omitempty"`
 	BinPath         string `json:"binPath,omitempty"`
+
+	// Named-tunnel fields (empty/zero for a quick tunnel).
+	Mode       string `json:"mode"`                 // "quick" | "named" | "" (off)
+	Hostname   string `json:"hostname,omitempty"`   // named-mode target hostname
+	Ready      int    `json:"ready,omitempty"`      // named: registered edge connections (0 = not up)
+	Account    bool   `json:"account"`              // a Cloudflare cert.pem exists (logged in)
+	LoginState string `json:"loginState,omitempty"` // "" | "pending" | "done" | "error"
+	LoginURL   string `json:"loginURL,omitempty"`   // Cloudflare auth URL to display during login
 }
 
 // Tunnel manages a cloudflared quick-tunnel process.
@@ -60,9 +68,17 @@ type Tunnel struct {
 
 	running   bool
 	publicURL string
-	pid       int      // cloudflared PID (spawned or adopted); 0 = none
-	localAddr string   // local addr the running tunnel forwards to
+	pid       int       // cloudflared PID (spawned or adopted); 0 = none
+	localAddr string    // local addr the running tunnel forwards to
 	cmd       *exec.Cmd // set only for a process WE spawned this run (for reaping); nil when adopted
+
+	// Named-tunnel live state (stateMu-guarded). mode is "quick" or "named" while running.
+	mode       string // "quick" | "named" | "" (not running)
+	hostname   string // named-mode target hostname
+	tunnelName string // named-mode cloudflared tunnel name (dw-<hostname>)
+	credFile   string // named-mode credentials JSON path
+	loginState string // "" | "pending" | "done" | "error" — cloudflared tunnel login progress
+	loginURL   string // Cloudflare auth URL parsed from the login output
 
 	// Download progress — written under startMu, read via atomics from any goroutine.
 	downloading     atomic.Bool
@@ -73,6 +89,15 @@ type Tunnel struct {
 	binPath   string
 	statePath string // <dataDir>/tunnel.json — persisted url+pid+localAddr
 	logPath   string // <dataDir>/tunnel.log  — detached cloudflared stderr/stdout
+
+	// Named-tunnel cloudflared home — per-dataDir so pro/terminal/teamworkbench can keep independent
+	// Cloudflare accounts + tunnel credentials. Preferred over the global ~/.cloudflared, but the
+	// global cert is honored as a fallback (resolveCert) so an existing `cloudflared tunnel login`
+	// is reused and we are robust to cloudflared writing the cert to its default location.
+	cfHome     string // <dataDir>/cloudflared
+	certPath   string // <dataDir>/cloudflared/cert.pem — preferred origin cert (login write target)
+	loginLog   string // <dataDir>/cloudflared/login.log — detached `tunnel login` output
+	globalCert string // ~/.cloudflared/cert.pem — fallback origin cert
 }
 
 // persistedState is the on-disk record that lets a fresh host process adopt an
@@ -82,6 +107,12 @@ type persistedState struct {
 	PID       int    `json:"pid"`
 	LocalAddr string `json:"localAddr"`
 	LogPath   string `json:"logPath,omitempty"`
+
+	// Named-tunnel fields (empty for a quick tunnel).
+	Mode       string `json:"mode,omitempty"`       // "" (quick) | "named"
+	Hostname   string `json:"hostname,omitempty"`   // named-mode hostname
+	TunnelName string `json:"tunnelName,omitempty"` // named-mode cloudflared tunnel name
+	CredFile   string `json:"credFile,omitempty"`   // named-mode credentials JSON path
 }
 
 // New creates a tunnel manager. dataDir is where cloudflared is cached AND where the
@@ -93,10 +124,19 @@ func New(dataDir string) *Tunnel {
 	if runtime.GOOS == "windows" {
 		binPath += ".exe"
 	}
+	cfHome := filepath.Join(dataDir, "cloudflared")
+	globalCert := ""
+	if home, err := os.UserHomeDir(); err == nil {
+		globalCert = filepath.Join(home, ".cloudflared", "cert.pem")
+	}
 	t := &Tunnel{
-		binPath:   binPath,
-		statePath: filepath.Join(dataDir, "tunnel.json"),
-		logPath:   filepath.Join(dataDir, "tunnel.log"),
+		binPath:    binPath,
+		statePath:  filepath.Join(dataDir, "tunnel.json"),
+		logPath:    filepath.Join(dataDir, "tunnel.log"),
+		cfHome:     cfHome,
+		certPath:   filepath.Join(cfHome, "cert.pem"),
+		loginLog:   filepath.Join(cfHome, "login.log"),
+		globalCert: globalCert,
 	}
 	if st, ok := t.loadState(); ok {
 		if pidAlive(st.PID) {
@@ -104,6 +144,13 @@ func New(dataDir string) *Tunnel {
 			t.publicURL = st.PublicURL
 			t.pid = st.PID
 			t.localAddr = st.LocalAddr
+			t.mode = st.Mode
+			if t.mode == "" {
+				t.mode = "quick"
+			}
+			t.hostname = st.Hostname
+			t.tunnelName = st.TunnelName
+			t.credFile = st.CredFile
 		} else {
 			t.removeState() // stale: the daemon died while no host was running
 		}
@@ -118,12 +165,17 @@ func (t *Tunnel) Status() State {
 	t.stateMu.RLock()
 	running := t.running && pidAlive(t.pid)
 	s := State{
-		Running:   running,
-		PublicURL: t.publicURL,
+		Running:    running,
+		PublicURL:  t.publicURL,
+		Mode:       t.mode,
+		Hostname:   t.hostname,
+		LoginState: t.loginState,
+		LoginURL:   t.loginURL,
 	}
 	if !running {
 		s.PublicURL = ""
 	}
+	named := running && t.mode == "named"
 	t.stateMu.RUnlock()
 
 	s.Downloading = t.downloading.Load()
@@ -133,6 +185,10 @@ func (t *Tunnel) Status() State {
 		s.DownloadURL = u
 	}
 	s.BinPath = t.binPath
+	s.Account = t.hasAccount()
+	if named {
+		s.Ready = countReadyFromLog(t.logPath)
+	}
 	return s
 }
 
@@ -173,7 +229,7 @@ func (t *Tunnel) Start(ctx context.Context, localAddr string) (string, error) {
 	}
 	if running && !pidAlive(pid) {
 		// adopted/spawned earlier but the daemon has since died → clear before re-spawning.
-		t.setState(false, "", 0, "", nil)
+		t.setState(false, "", 0, "", nil, "", "")
 		t.removeState()
 	}
 
@@ -181,7 +237,9 @@ func (t *Tunnel) Start(ctx context.Context, localAddr string) (string, error) {
 	if st, ok := t.loadState(); ok {
 		switch {
 		case pidAlive(st.PID) && st.LocalAddr == localAddr:
-			t.setState(true, st.PublicURL, st.PID, st.LocalAddr, nil)
+			// A tunnel is already live on this addr — reuse it, preserving named identity so a
+			// stray quick Start() never mislabels a running named tunnel.
+			t.adoptPersisted(st)
 			return st.PublicURL, nil
 		case pidAlive(st.PID) && st.LocalAddr != localAddr:
 			killPID(st.PID) // points at a different local addr — replace it
@@ -223,7 +281,7 @@ func (t *Tunnel) Start(ctx context.Context, localAddr string) (string, error) {
 	// Reap the child if it dies while WE are still alive; if the host dies first, init reaps it.
 	go cmd.Wait() //nolint:errcheck
 
-	t.setState(true, url, cmd.Process.Pid, localAddr, cmd)
+	t.setState(true, url, cmd.Process.Pid, localAddr, cmd, "quick", "")
 	t.saveState(persistedState{PublicURL: url, PID: cmd.Process.Pid, LocalAddr: localAddr, LogPath: t.logPath})
 
 	return url, nil
@@ -243,6 +301,10 @@ func (t *Tunnel) Stop() {
 	t.pid = 0
 	t.localAddr = ""
 	t.cmd = nil
+	t.mode = ""
+	t.hostname = ""
+	t.tunnelName = ""
+	t.credFile = ""
 	t.stateMu.Unlock()
 
 	// Fall back to the persisted pid if this host process never adopted one in memory.
@@ -258,14 +320,21 @@ func (t *Tunnel) Stop() {
 	t.removeState()
 }
 
-// setState atomically updates the live tunnel fields.
-func (t *Tunnel) setState(running bool, url string, pid int, addr string, cmd *exec.Cmd) {
+// setState atomically updates the live tunnel fields. mode is "quick"/"named" while running,
+// "" when clearing; named credentials are cleared on any not-running transition.
+func (t *Tunnel) setState(running bool, url string, pid int, addr string, cmd *exec.Cmd, mode, hostname string) {
 	t.stateMu.Lock()
 	t.running = running
 	t.publicURL = url
 	t.pid = pid
 	t.localAddr = addr
 	t.cmd = cmd
+	t.mode = mode
+	t.hostname = hostname
+	if !running {
+		t.tunnelName = ""
+		t.credFile = ""
+	}
 	t.stateMu.Unlock()
 }
 
@@ -362,12 +431,14 @@ func parseTunnelURLFromLog(path string, pid int, timeout time.Duration) (string,
 	}
 }
 
-// lastLogError returns the last cloudflared error/fatal line, for diagnostics.
+// lastLogError returns the last cloudflared error/fatal line, for diagnostics. Handles both the
+// legacy logfmt (`level=error`) and the current console format (`… ERR …` / `… FTL …`).
 func lastLogError(log string) string {
 	var last string
 	for _, line := range strings.Split(log, "\n") {
-		if strings.Contains(line, "level=error") || strings.Contains(line, "level=fatal") {
-			last = line
+		if strings.Contains(line, "level=error") || strings.Contains(line, "level=fatal") ||
+			strings.Contains(line, " ERR ") || strings.Contains(line, " FTL ") {
+			last = strings.TrimSpace(line)
 		}
 	}
 	return last
