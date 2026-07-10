@@ -523,6 +523,82 @@ func idFromRolloutName(name string) string {
 	return strings.Join(parts[len(parts)-5:], "-")
 }
 
+// CodexModelUsage is one per-turn token-usage delta tagged with the model that
+// was active for that turn (a session may switch models mid-conversation).
+type CodexModelUsage struct {
+	At              time.Time
+	Model           string
+	InputTokens     int
+	OutputTokens    int
+	CacheReadTokens int
+}
+
+// ScanCodexModelUsage streams one rollout-*.jsonl file and returns its
+// per-turn, model-tagged token deltas — the SSOT primitive for any cost/report
+// aggregation over codex usage (e.g. a usage/cost report). It reuses
+// EXACTLY the field extraction LoadTranscript uses to build its usage footer
+// (event_msg/token_count → info.last_token_usage → usageMap()), so there is a
+// single parser for the codex rollout wire format; callers outside this
+// package must not re-parse rollout jsonl themselves.
+//
+// DEDUP: only last_token_usage (the per-turn delta) is read. total_token_usage
+// is a cumulative running counter that — on sessions interleaving multiple
+// conversations/subagents — is NOT safe to sum directly (it double- or
+// under-counts depending on how it's read); last_token_usage has no such
+// hazard because codex resets it fresh on every turn.
+//
+// model is taken from the most recent preceding turn_context line (empty
+// string if none seen yet — an honest "unknown model" bucket, never guessed).
+func ScanCodexModelUsage(path string) ([]CodexModelUsage, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var (
+		model  string
+		events []CodexModelUsage
+	)
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 1<<20), 64<<20) // rollout lines can be large
+	for sc.Scan() {
+		var line codexLine
+		if json.Unmarshal(sc.Bytes(), &line) != nil {
+			continue
+		}
+		switch line.Type {
+		case "turn_context":
+			if tc := line.asTurnContext(); tc != nil && tc.Model != "" {
+				model = tc.Model
+			}
+		case "event_msg":
+			if line.payloadType() != "token_count" {
+				continue
+			}
+			tc := line.asTokenCount()
+			if tc == nil || tc.Info == nil {
+				continue // rate-limit-only line (info=null) → no usage payload
+			}
+			u := tc.Info.LastTokenUsage.usageMap()
+			if u == nil {
+				continue // all-zero turn → honest skip (same rule as LoadTranscript)
+			}
+			events = append(events, CodexModelUsage{
+				At:              line.time(),
+				Model:           model,
+				InputTokens:     intField(u, "input_tokens"),
+				OutputTokens:    intField(u, "output_tokens"),
+				CacheReadTokens: intField(u, "cache_read_input_tokens"),
+			})
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return events, err
+	}
+	return events, nil
+}
+
 // codexTitleFromCwd derives a fallback title from the session's cwd basename.
 func codexTitleFromCwd(cwd string) string {
 	cwd = strings.TrimSpace(cwd)

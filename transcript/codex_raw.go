@@ -132,6 +132,23 @@ func (l *codexLine) asTokenCount() *codexTokenCount {
 	return &t
 }
 
+// codexTurnContext is a top-level type=turn_context line's payload. codex emits
+// one before the turns it governs; "model" is the only field the usage/cost
+// path needs (a session can switch models mid-conversation, e.g. user runs
+// /model). Other turn_context fields (sandbox_policy, approval_policy, ...)
+// are intentionally not modeled here — add them if a future consumer needs them.
+type codexTurnContext struct {
+	Model string `json:"model"`
+}
+
+func (l *codexLine) asTurnContext() *codexTurnContext {
+	var t codexTurnContext
+	if json.Unmarshal(l.Payload, &t) != nil {
+		return nil
+	}
+	return &t
+}
+
 // usageMap projects codex's per-turn token usage onto the generic map the @ce
 // usage block consumes — using the SAME keys claude inlines (SSOT), so the
 // frontend stays runtime-agnostic. nil → nil so the caller emits no usage block
