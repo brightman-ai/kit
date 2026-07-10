@@ -15,9 +15,9 @@ import (
 //	~/.claude/projects/{encode(projectDir)}/*.jsonl
 //
 // where encode replaces every '/' in the absolute project dir with '-'
-// (verified: /home/ubuntu/code/stwork/deepwork-pro →
+// (e.g. /home/user/my-project →
 //
-//	-home-ubuntu-code-stwork-deepwork-pro).
+//	-home-user-my-project).
 //
 // Each *.jsonl is one session transcript (the SSOT). This source is strictly
 // read-only: it never writes or deletes a jsonl.
@@ -200,6 +200,12 @@ func (s *ClaudeSource) LoadTranscript(ctx context.Context, ref SessionRef) (*Tra
 	pending := map[string]toolLoc{}
 	var aiTitle string
 	var totalIn, totalOut, totalCacheRead int
+	// Coalesce the split lines of ONE claude assistant message (thinking/text/tool_use
+	// each on its own jsonl line, all sharing message.id, possibly across intervening
+	// tool_result user lines) back into a single turn. Tracks the last assistant turn's
+	// index + message.id; a match folds blocks in instead of spawning another bubble.
+	lastAsstIdx := -1
+	lastAsstMsgID := ""
 
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 1<<20), 32<<20)
@@ -220,7 +226,7 @@ func (s *ClaudeSource) LoadTranscript(ctx context.Context, ref SessionRef) (*Tra
 			}
 			s.appendUserTurn(tr, &line, pending)
 		case "assistant":
-			s.appendAssistantTurn(tr, &line, pending, &totalIn, &totalOut, &totalCacheRead)
+			s.appendAssistantTurn(tr, &line, pending, &totalIn, &totalOut, &totalCacheRead, &lastAsstIdx, &lastAsstMsgID)
 		default:
 			// mode / permission-mode / last-prompt / system / attachment /
 			// file-history-snapshot / queue-operation → metadata, skipped.
@@ -302,10 +308,35 @@ func (s *ClaudeSource) appendUserTurn(tr *Transcript, line *rawLine, pending map
 
 // appendAssistantTurn parses an assistant line into a turn of typed blocks and
 // registers any tool_use ids so their results can be back-attached.
-func (s *ClaudeSource) appendAssistantTurn(tr *Transcript, line *rawLine, pending map[string]toolLoc, totalIn, totalOut, totalCacheRead *int) {
+func (s *ClaudeSource) appendAssistantTurn(tr *Transcript, line *rawLine, pending map[string]toolLoc, totalIn, totalOut, totalCacheRead *int, lastAsstIdx *int, lastAsstMsgID *string) {
 	at := line.time()
-	turn := Turn{Index: len(tr.Turns), Role: "assistant", At: tsPtr(at)}
-	turnIdx := len(tr.Turns)
+	m := line.msg()
+	msgID := ""
+	if m != nil {
+		msgID = m.ID
+	}
+
+	// Coalesce: one claude assistant message's blocks arrive as SEPARATE jsonl lines
+	// sharing message.id (可跨中间的 tool_result user 行 → 见 219 例非连续), and each
+	// line REPEATS the full usage. Fold a same-id line into the current assistant turn
+	// so a turn = one bubble (not N) and usage counts once (not N×). message.id 全局
+	// 唯一 → id 命中必是同一逻辑消息, 无需按行连续性判定。
+	merge := msgID != "" && *lastAsstMsgID == msgID &&
+		*lastAsstIdx >= 0 && *lastAsstIdx < len(tr.Turns) &&
+		tr.Turns[*lastAsstIdx].Role == "assistant"
+
+	turnIdx := *lastAsstIdx
+	if !merge {
+		turnIdx = len(tr.Turns)
+		tr.Turns = append(tr.Turns, Turn{Index: turnIdx, Role: "assistant", At: tsPtr(at)})
+	}
+	turn := &tr.Turns[turnIdx] // stable: we only append to turn.Blocks below, not tr.Turns
+	// Advance the turn's timestamp to the LATEST split line (chronological jsonl) so 总耗时
+	// = completion − preceding user send stays the full turn duration, not just time-to-first
+	// -thinking-line (folding onto the first line's ts would shrink a 24s turn to ~5s).
+	if merge && !at.IsZero() {
+		turn.At = tsPtr(at)
+	}
 
 	for _, p := range line.contentParts() {
 		switch p.Type {
@@ -333,28 +364,42 @@ func (s *ClaudeSource) appendAssistantTurn(tr *Transcript, line *rawLine, pendin
 	}
 
 	// Engine (message.model) → tr.Meta once, for the overview model name + cost derivation.
-	if m := line.msg(); m != nil && m.Model != "" {
+	// Usage counted ONCE per message.id: each split line repeats the full usage, so fold
+	// it in only while this turn carries none yet (turnHasUsage) — else totals inflate N×.
+	if m != nil && m.Model != "" {
 		if _, ok := tr.Meta["model"]; !ok {
 			tr.Meta["model"] = m.Model
 		}
-		// usage footer (rmeta) — surface on the turn as a usage block + accumulate. Inline
-		// the model on the block too (per-turn overview reads it off the usage object).
-		if u := line.usage(); u != nil {
+		if u := line.usage(); u != nil && !turnHasUsage(turn) {
 			u["model"] = m.Model
 			turn.Blocks = append(turn.Blocks, Block{Type: BlockUsage, Usage: u})
 			*totalIn += intField(u, "input_tokens")
 			*totalOut += intField(u, "output_tokens")
 			*totalCacheRead += intField(u, "cache_read_input_tokens")
 		}
-	} else if u := line.usage(); u != nil {
+	} else if u := line.usage(); u != nil && !turnHasUsage(turn) {
 		turn.Blocks = append(turn.Blocks, Block{Type: BlockUsage, Usage: u})
 		*totalIn += intField(u, "input_tokens")
 		*totalOut += intField(u, "output_tokens")
 		*totalCacheRead += intField(u, "cache_read_input_tokens")
 	}
 
-	if len(turn.Blocks) == 0 {
+	// A brand-new turn that produced nothing renderable → drop it (preserve prior behavior).
+	if !merge && len(turn.Blocks) == 0 {
+		tr.Turns = tr.Turns[:turnIdx]
 		return
 	}
-	tr.Turns = append(tr.Turns, turn)
+	*lastAsstIdx = turnIdx
+	*lastAsstMsgID = msgID
+}
+
+// turnHasUsage reports whether a usage block was already folded into this turn — the
+// dedupe guard for a claude message whose duplicated split lines each repeat its usage.
+func turnHasUsage(turn *Turn) bool {
+	for i := range turn.Blocks {
+		if turn.Blocks[i].Type == BlockUsage {
+			return true
+		}
+	}
+	return false
 }

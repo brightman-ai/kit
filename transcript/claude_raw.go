@@ -76,6 +76,12 @@ type rawMessage struct {
 	Role    string          `json:"role"`
 	Content json.RawMessage `json:"content"`
 	Usage   json.RawMessage `json:"usage"`
+	// ID is the Anthropic message id (msg_XXX). claude jsonl writes ONE assistant
+	// message's content blocks (thinking / text / tool_use) as SEPARATE lines that
+	// all share this id (and each REPEATS the full usage) — coalesced back into one
+	// turn by message.id in appendAssistantTurn (else a turn renders as N bubbles +
+	// its usage counts N times).
+	ID string `json:"id"`
 	// Model is the engine that produced an assistant line (claude jsonl inlines it on
 	// message.model). Surfaced onto the turn's usage block + tr.Meta so the overview
 	// renders the model name + derives cost — instead of an honest-but-blank「—」.
