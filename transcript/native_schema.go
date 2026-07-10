@@ -6,7 +6,7 @@ import "encoding/json"
 // wire schema (deepwork.native_transcript.v1 / v1.1). Before this file the
 // shape was declared TWICE — once as an unexported READ view here
 // (deepwork_raw.go's former dwLine/dwMessage/dwContentBlock/dwUsage/dwMetrics)
-// and once as the WRITE model in deepwork-pro's pkg/worktranscript
+// and once as the WRITE model in a host's worktranscript package
 // (Entry/Message/ContentBlock/TurnUsage/TurnMetrics) — with no compiler check
 // that the two stayed byte-compatible. Both sides now import these exported
 // Native* types instead.

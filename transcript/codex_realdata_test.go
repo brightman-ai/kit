@@ -12,7 +12,10 @@ import (
 // skipped automatically when ~/.codex/sessions is absent (fresh CI boxes), so it
 // never fails a clean checkout — a live-evidence probe, not a gate.
 func TestCodexSource_RealTranscript(t *testing.T) {
-	const projectDir = "/home/ubuntu/code/stwork/deepwork-pro"
+	projectDir := os.Getenv("KIT_REALDATA_PROJECT")
+	if projectDir == "" {
+		t.Skip("KIT_REALDATA_PROJECT unset — skipping real-data live-evidence probe")
+	}
 	src := NewCodexSource()
 	if _, err := os.Stat(src.sessionsDir()); err != nil {
 		t.Skipf("no real codex SSOT (%v) — skipping live evidence probe", err)

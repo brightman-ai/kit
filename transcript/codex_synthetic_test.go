@@ -19,7 +19,7 @@ func writeCodexFixture(t *testing.T) (root, id string) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	cwd := "/home/ubuntu/code/stwork/deepwork-pro"
+	cwd := "/home/user/my-project"
 	lines := []string{
 		`{"timestamp":"2026-06-18T10:00:00.000Z","type":"session_meta","payload":{"id":"` + id + `","timestamp":"2026-06-18T10:00:00.000Z","cwd":"` + cwd + `"}}`,
 		// real user turn
@@ -55,7 +55,7 @@ func TestCodexSource_SyntheticUsageAndPatchPath(t *testing.T) {
 
 	src := NewCodexSource()
 	tr, err := src.LoadTranscript(context.Background(), SessionRef{
-		ProjectDir: "/home/ubuntu/code/stwork/deepwork-pro", ID: id,
+		ProjectDir: "/home/user/my-project", ID: id,
 	})
 	if err != nil {
 		t.Fatalf("LoadTranscript: %v", err)

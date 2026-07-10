@@ -43,7 +43,7 @@ func (s *ClaudeSource) Kind() string { return KindClaude }
 // EncodeProjectDir maps an absolute project dir to claude's directory name.
 // claude collapses BOTH '/' and '.' to '-', so `/home/u/.deepwork/ws` becomes
 // `-home-u--deepwork-ws` (the '/.' → '--'). Encoding only '/' was a latent bug:
-// it worked for dot-free paths (…/deepwork-pro) but pointed at a non-existent
+// it worked for dot-free paths (…/my-project) but pointed at a non-existent
 // shard for any dotted path (…/.deepwork/…) — which broke session reads AND the
 // collaborate jail's RW bind of that shard (jailed agent could not persist its turn).
 func EncodeProjectDir(projectDir string) string {

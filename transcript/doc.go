@@ -9,8 +9,8 @@
 // downstream consumer are unchanged. Soft-delete/rename live in the host's own
 // HiddenStore overlay and never touch the runtime transcript (SSOT protection).
 //
-// Consumers: deepwork-pro (webui read side + native write side) and
-// deepwork-terminal both import this package instead of re-declaring the model +
+// Consumers: a web UI host (read + native-write sides) and deepwork-terminal
+// both import this package instead of re-declaring the model +
 // parsers — collapsing three hand-synced copies into one. Pure stdlib; the DB
 // coupling is inverted via the DeepworkSessionProvider / HiddenStore interfaces.
 package transcript

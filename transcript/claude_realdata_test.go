@@ -13,7 +13,10 @@ import (
 // skipped automatically when the SSOT directory is absent (e.g. fresh CI boxes),
 // so it never fails a clean checkout — it is a live-evidence probe, not a gate.
 func TestClaudeSource_RealTranscript(t *testing.T) {
-	const projectDir = "/home/ubuntu/code/stwork/deepwork-pro"
+	projectDir := os.Getenv("KIT_REALDATA_PROJECT")
+	if projectDir == "" {
+		t.Skip("KIT_REALDATA_PROJECT unset — skipping real-data live-evidence probe")
+	}
 	src := NewClaudeSource()
 	if _, err := os.Stat(src.projectDirPath(projectDir)); err != nil {
 		t.Skipf("no real claude SSOT for %s (%v) — skipping live evidence probe", projectDir, err)
