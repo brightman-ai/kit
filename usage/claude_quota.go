@@ -15,7 +15,6 @@ package usage
 import (
 	"encoding/json"
 	"os"
-	"path/filepath"
 	"time"
 )
 
@@ -41,13 +40,7 @@ type claudeRateLimits struct {
 
 // claudeRateLimitsPath returns ~/.deepwork/claude-rate-limits.json.
 // DEEPWORK_HOME overrides the dir (matches the hook script + tests).
-func claudeRateLimitsPath() string {
-	if dir := os.Getenv("DEEPWORK_HOME"); dir != "" {
-		return filepath.Join(dir, "claude-rate-limits.json")
-	}
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".deepwork", "claude-rate-limits.json")
-}
+func claudeRateLimitsPath() string { return deepworkFile("claude-rate-limits.json") }
 
 // readClaudeRateLimits loads the hook drop file. ok=false when the file is
 // missing/unreadable/unparseable, or when it carries NO usable signal — i.e. no
@@ -67,6 +60,36 @@ func readClaudeRateLimits(path string) (claudeRateLimits, bool) {
 		return claudeRateLimits{}, false
 	}
 	return rl, true
+}
+
+// claudeHookReading turns the statusline-hook drop file into a Reading. nil when the hook has
+// never produced anything usable.
+//
+// An "api" reading carries no windows BY DESIGN (API-key billing has no subscription window),
+// and is still a perfectly good reading — it is how we know which kind of money is being spent.
+func claudeHookReading() *Reading {
+	path := claudeRateLimitsPath()
+	rl, ok := readClaudeRateLimits(path)
+	if !ok {
+		return nil
+	}
+	at := snapshotTime(rl.CapturedAt, path)
+	if at.IsZero() {
+		return nil
+	}
+
+	r := &Reading{CapturedAt: at, Source: SourceHook, Billing: BillingSubscription}
+	if rl.Source == "api" {
+		r.Billing = BillingAPI
+		return r
+	}
+	if w, ok := claudeQuotaWindow("5h", rl.FiveHour); ok {
+		r.Windows = append(r.Windows, w)
+	}
+	if w, ok := claudeQuotaWindow("7d", rl.SevenDay); ok {
+		r.Windows = append(r.Windows, w)
+	}
+	return r
 }
 
 // claudeQuotaWindow maps a claude window onto the unified QuotaWindow (5h/7d).

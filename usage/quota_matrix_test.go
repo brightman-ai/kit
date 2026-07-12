@@ -1,6 +1,7 @@
 package usage
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -131,7 +132,7 @@ func TestQuota_SubscriptionFresh(t *testing.T) {
 	env := newQuotaEnv(t).withCredentials(t).withCLI(t, "claude")
 	env.withRateLimits(t, "subscription", time.Now().Add(-2*time.Minute), time.Now().Add(3*time.Hour), 60)
 
-	q := queryClaudeQuota()
+	q := claudeProvider{}.Query()
 
 	if !q.Present {
 		t.Fatal("UB-01: logged-in account must be present")
@@ -159,7 +160,7 @@ func TestQuota_ExecutableBroken_ProviderSurvives(t *testing.T) {
 	env := newQuotaEnv(t).withCredentials(t).withBrokenCLI(t, "claude")
 	env.withRateLimits(t, "subscription", time.Now().Add(-1*time.Minute), time.Now().Add(3*time.Hour), 55)
 
-	q := queryClaudeQuota()
+	q := claudeProvider{}.Query()
 
 	// The whole point: a dead binary degrades the card, it does not delete it.
 	if !q.Present {
@@ -182,32 +183,57 @@ func TestQuota_ExecutableBroken_ProviderSurvives(t *testing.T) {
 // not_installed and not_executable are different stories and must not be conflated.
 func TestQuota_NotInstalled_DistinctFromNotExecutable(t *testing.T) {
 	newQuotaEnv(t).withCredentials(t) // no binary at all
-	if got := queryClaudeQuota().Health; got.OK || got.Reason != HealthNotInstalled {
+	if got := (claudeProvider{}).Query().Health; got.OK || got.Reason != HealthNotInstalled {
 		t.Fatalf("health = %+v, want ok=false reason=not_installed", got)
 	}
 }
 
 // ── UB-03 · stale snapshot ────────────────────────────────────────────────────
 
-func TestQuota_SnapshotStale_WindowRolled(t *testing.T) {
+// A rolled window is flagged PER WINDOW. The 5h window resetting says nothing about the 7d
+// window, and condemning the whole reading would throw away a number that is still true.
+func TestQuota_WindowExpiry_IsPerWindow(t *testing.T) {
 	env := newQuotaEnv(t).withCredentials(t).withCLI(t, "claude")
-	// Reading taken 6h ago describing a window that reset 1h ago → the used% we hold is
-	// certainly wrong now.
+	// 5h reset an hour ago (rolled → its used% is certainly wrong now); 7d resets in 2 days.
 	env.withRateLimits(t, "subscription", time.Now().Add(-6*time.Hour), time.Now().Add(-1*time.Hour), 90)
 
-	q := queryClaudeQuota()
+	q := claudeProvider{}.Query()
 
 	if !q.Present {
 		t.Fatal("UB-03: stale data must not hide the provider")
 	}
-	if len(q.Windows) == 0 {
-		t.Fatal("UB-03: last-known values are still shown (flagged, not deleted)")
+	if len(q.Windows) != 2 {
+		t.Fatalf("UB-03: both windows are still reported, got %d", len(q.Windows))
 	}
-	if q.Snapshot == nil || !q.Snapshot.Stale {
-		t.Fatalf("UB-03: snapshot must be flagged stale, got %+v", q.Snapshot)
+	if !q.Windows[0].Expired {
+		t.Fatal("UB-03: the 5h window rolled — it must be flagged expired")
 	}
-	if q.Snapshot.StaleReason != "window_rolled" {
-		t.Fatalf("UB-03: stale_reason = %q, want window_rolled", q.Snapshot.StaleReason)
+	if q.Windows[1].Expired {
+		t.Fatal("UB-03: the 7d window has NOT rolled — flagging it would discard a true number")
+	}
+	// Not every window rolled, so the reading as a whole is not condemned.
+	if q.Snapshot == nil || q.Snapshot.Stale {
+		t.Fatalf("UB-03: one rolled window must not condemn the whole snapshot, got %+v", q.Snapshot)
+	}
+}
+
+// When EVERY window has rolled, the reading as a whole is worthless — say so.
+func TestQuota_SnapshotStale_AllWindowsRolled(t *testing.T) {
+	env := newQuotaEnv(t).withCredentials(t).withCLI(t, "codex")
+	env.withCodexAuth(t, false)
+	// The fixture puts the 7d reset 72h after the 5h one, so back-date far enough that BOTH
+	// windows have already rolled.
+	env.withCodexRollout(t, "pro", time.Now().Add(-100*time.Hour))
+
+	q := codexProvider{}.Query()
+
+	for i, w := range q.Windows {
+		if !w.Expired {
+			t.Fatalf("UB-03: window %d (%s) rolled and must be flagged expired", i, w.Kind)
+		}
+	}
+	if q.Snapshot == nil || !q.Snapshot.Stale || q.Snapshot.StaleReason != "window_rolled" {
+		t.Fatalf("UB-03: every window rolled → snapshot stale/window_rolled, got %+v", q.Snapshot)
 	}
 }
 
@@ -216,7 +242,7 @@ func TestQuota_SnapshotStale_TooOld(t *testing.T) {
 	// No reset time to check against; age alone must trip staleness past maxSnapshotAge.
 	env.withRateLimits(t, "subscription", time.Now().Add(-30*time.Hour), time.Time{}, 20)
 
-	q := queryClaudeQuota()
+	q := claudeProvider{}.Query()
 
 	if q.Snapshot == nil || !q.Snapshot.Stale || q.Snapshot.StaleReason != "too_old" {
 		t.Fatalf("UB-03: want stale/too_old, got %+v", q.Snapshot)
@@ -228,7 +254,7 @@ func TestQuota_SnapshotStale_TooOld(t *testing.T) {
 func TestQuota_LoggedInNoSnapshot(t *testing.T) {
 	newQuotaEnv(t).withCredentials(t).withCLI(t, "claude") // credentials, but the hook never fired
 
-	q := queryClaudeQuota()
+	q := claudeProvider{}.Query()
 
 	if !q.Present || !hasEvidence(q.Evidence, EvidenceCredentials) {
 		t.Fatalf("UB-04: logged-in account must be present, got %+v", q)
@@ -249,7 +275,7 @@ func TestQuota_LoggedInNoSnapshot(t *testing.T) {
 func TestQuota_LoggedOutEmpty_Hidden(t *testing.T) {
 	newQuotaEnv(t) // no credentials, no snapshot, no sessions — nothing at all
 
-	q := queryClaudeQuota()
+	q := claudeProvider{}.Query()
 
 	if q.Present || len(q.Evidence) != 0 {
 		t.Fatalf("UB-05: nothing on disk ⟹ not present, got %+v", q)
@@ -265,7 +291,7 @@ func TestQuota_EmptySessionSkeleton_IsNotEvidence(t *testing.T) {
 		t.Fatalf("mkdir sessions: %v", err)
 	}
 
-	if q := queryCodexQuota(); q.Present {
+	if q := (codexProvider{}).Query(); q.Present {
 		t.Fatalf("UB-05: an empty session skeleton must not count as presence, got %+v", q)
 	}
 }
@@ -280,7 +306,7 @@ func TestQuota_LogoutResidue_ShownButNotClaimedLoggedIn(t *testing.T) {
 	}
 	write(t, filepath.Join(projects, "session.jsonl"), `{"type":"assistant"}`+"\n")
 
-	q := queryClaudeQuota()
+	q := claudeProvider{}.Query()
 
 	if !q.Present {
 		t.Fatal("UB-05: local history is presence evidence")
@@ -299,7 +325,7 @@ func TestQuota_ClaudeAPIBilling(t *testing.T) {
 	env := newQuotaEnv(t).withCredentials(t).withCLI(t, "claude")
 	env.withRateLimits(t, "api", time.Now().Add(-1*time.Minute), time.Time{}, -1) // api session: no windows
 
-	q := queryClaudeQuota()
+	q := claudeProvider{}.Query()
 
 	if !q.Present {
 		t.Fatal("UB-09: API-billed account must still surface")
@@ -318,7 +344,7 @@ func TestQuota_ClaudeAPIBilling(t *testing.T) {
 func TestQuota_CodexAPIOnly_FromAuthShape(t *testing.T) {
 	newQuotaEnv(t).withCodexAuth(t, true).withCLI(t, "codex") // API key, no rollout
 
-	q := queryCodexQuota()
+	q := codexProvider{}.Query()
 
 	if !q.Present {
 		t.Fatal("UB-09: API-key codex account must surface")
@@ -335,7 +361,7 @@ func TestQuota_CodexSubscription(t *testing.T) {
 	env := newQuotaEnv(t).withCodexAuth(t, false).withCLI(t, "codex")
 	env.withCodexRollout(t, "plus", time.Now().Add(2*time.Hour))
 
-	q := queryCodexQuota()
+	q := codexProvider{}.Query()
 
 	if !q.Present || q.Billing != BillingSubscription {
 		t.Fatalf("codex subscription: present=%v billing=%q", q.Present, q.Billing)
@@ -355,7 +381,7 @@ func TestQuota_CodexSubscription(t *testing.T) {
 func TestQuota_CodexBrokenCLI_ProviderSurvives(t *testing.T) {
 	newQuotaEnv(t).withCodexAuth(t, false).withBrokenCLI(t, "codex")
 
-	q := queryCodexQuota()
+	q := codexProvider{}.Query()
 
 	if !q.Present {
 		t.Fatal("UB-02 (codex): broken executable must not delete the account")
@@ -368,7 +394,75 @@ func TestQuota_CodexBrokenCLI_ProviderSurvives(t *testing.T) {
 // ── gemini: not_implemented never masquerades as a supported provider ──────────
 
 func TestQuota_GeminiNeverPresent(t *testing.T) {
-	if q := queryGeminiQuota(); q.Present {
+	if q := (geminiProvider{}).Query(); q.Present {
 		t.Fatal("gemini is unsupported and must not surface as a provider")
+	}
+}
+
+// ── provenance + the merge rule ───────────────────────────────────────────────
+
+// The probe exists because re-reading the disk cannot always help: codex records only the
+// limit family of the model it is RUNNING, so a session on a per-model plan leaves the account
+// limit frozen. The freshest reading must therefore win — and, critically, the very next
+// background poll must NOT quietly revert a probe result by re-reading an older transcript.
+func TestQuota_ProbeBeatsOlderRollout_AndSurvivesReload(t *testing.T) {
+	env := newQuotaEnv(t).withCodexAuth(t, false).withCLI(t, "codex")
+	env.withCodexRollout(t, "pro", time.Now().Add(2*time.Hour)) // rollout reading: 2026-07-12T10:00Z
+
+	// A probe taken NOW — hours after the rollout's newest account entry.
+	probe := fmt.Sprintf(
+		`{"captured_at":%d,"source":"probe","plan_type":"pro","primary":{"used_percent":9,"window_minutes":300,"resets_at":%d},"secondary":{"used_percent":16,"window_minutes":10080,"resets_at":%d}}`,
+		time.Now().Unix(), time.Now().Add(3*time.Hour).Unix(), time.Now().Add(150*time.Hour).Unix())
+	write(t, filepath.Join(env.deepwork, "codex-rate-limits.json"), probe)
+
+	q := (codexProvider{}).Query()
+
+	if q.Snapshot == nil || q.Snapshot.Source != SourceProbe {
+		t.Fatalf("the fresher probe must win, got source=%v", q.Snapshot)
+	}
+	if q.Windows[0].RemainingPercent != 91 {
+		t.Fatalf("5h remaining = %v, want 91 (the probe's number, not the rollout's 22)",
+			q.Windows[0].RemainingPercent)
+	}
+	// Query() is what every background poll calls. Calling it again must not revert.
+	if again := (codexProvider{}).Query(); again.Snapshot.Source != SourceProbe {
+		t.Fatal("a poll re-reading the transcript must NOT revert the probe result")
+	}
+}
+
+// An older probe must not hold back a transcript that has since moved on.
+func TestQuota_FresherRolloutBeatsStaleProbe(t *testing.T) {
+	env := newQuotaEnv(t).withCodexAuth(t, false).withCLI(t, "codex")
+	env.withCodexRollout(t, "pro", time.Now().Add(2*time.Hour)) // rollout: 2026-07-12T10:00Z
+
+	stale := fmt.Sprintf(
+		`{"captured_at":%d,"source":"probe","plan_type":"pro","primary":{"used_percent":1,"window_minutes":300,"resets_at":%d}}`,
+		time.Date(2026, 7, 12, 8, 0, 0, 0, time.UTC).Unix(), time.Now().Add(3*time.Hour).Unix())
+	write(t, filepath.Join(env.deepwork, "codex-rate-limits.json"), stale)
+
+	q := (codexProvider{}).Query()
+
+	if q.Snapshot == nil || q.Snapshot.Source != SourceRollout {
+		t.Fatalf("the fresher rollout must win over a 2h-older probe, got %v", q.Snapshot)
+	}
+}
+
+// Probing is a domain fact, not a caller's guess: claude cannot be asked (its usage arrives
+// only when claude itself renders), codex can. ProbeAll says so per runtime.
+func TestProbeAll_ReportsWhatEachRuntimeCanDo(t *testing.T) {
+	newQuotaEnv(t) // no codex auth → codex has no token to ask with either
+
+	byRuntime := map[string]string{}
+	for _, r := range ProbeAll(context.Background()) {
+		byRuntime[r.Runtime] = r.Status
+	}
+	if byRuntime["claude"] != ProbeNotSupported {
+		t.Fatalf("claude exposes no endpoint to ask — want not_supported, got %q", byRuntime["claude"])
+	}
+	if byRuntime["gemini"] != ProbeNotSupported {
+		t.Fatalf("gemini is unsupported — want not_supported, got %q", byRuntime["gemini"])
+	}
+	if byRuntime["codex"] != ProbeNotSupported {
+		t.Fatalf("no OAuth token ⟹ nothing to ask with — want not_supported, got %q", byRuntime["codex"])
 	}
 }

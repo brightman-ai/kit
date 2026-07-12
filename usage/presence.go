@@ -29,6 +29,16 @@ import (
 
 // ── path resolution (delegated to kit/transcript — see transcript/roots.go) ───
 
+// deepworkFile resolves a file under ~/.deepwork (DEEPWORK_HOME overrides — the same knob the
+// statusline hook script honours). This is where WE keep the readings we captured ourselves.
+func deepworkFile(name string) string {
+	if dir := os.Getenv("DEEPWORK_HOME"); dir != "" {
+		return filepath.Join(dir, name)
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".deepwork", name)
+}
+
 func claudeCredentialsPath() string {
 	return filepath.Join(transcript.ClaudeHome(), ".credentials.json")
 }

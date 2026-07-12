@@ -72,6 +72,39 @@ type codexRolloutLine struct {
 	} `json:"payload"`
 }
 
+// codexRolloutReading returns the most recent ACCOUNT reading codex has written to a rollout.
+// nil when it has never written one.
+//
+// This source only moves when CODEX chooses to move it, which is the trap: codex records the
+// rate-limit family of the model it is currently RUNNING, so a session on a per-model plan
+// (GPT-5.3-Codex-Spark) leaves the account limit frozen at whatever it was before the switch.
+// No amount of re-reading helps — that is what the probe is for.
+func codexRolloutReading() *Reading {
+	rl, at, ok := latestCodexRateLimits(codexSessionsDir())
+	if !ok {
+		return nil
+	}
+	return &Reading{
+		CapturedAt: at,
+		Source:     SourceRollout,
+		Plan:       rl.PlanType,
+		Billing:    BillingSubscription, // a rate-limit family only exists for subscription accounts
+		Windows:    codexWindows(rl.Primary, rl.Secondary),
+	}
+}
+
+// codexWindows maps codex's primary/secondary slots onto the unified windows.
+func codexWindows(primary, secondary *codexRateWindow) []QuotaWindow {
+	var out []QuotaWindow
+	if w, ok := codexQuotaWindow(primary); ok {
+		out = append(out, w)
+	}
+	if w, ok := codexQuotaWindow(secondary); ok {
+		out = append(out, w)
+	}
+	return out
+}
+
 // latestCodexRateLimits returns the most recent ACCOUNT rate-limit reading across the few
 // newest rollouts, along with when it was captured. ok=false when no such reading exists.
 func latestCodexRateLimits(root string) (rl codexRateLimits, capturedAt time.Time, ok bool) {

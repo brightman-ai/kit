@@ -18,9 +18,10 @@ import (
 // binary lost its executable bit:
 //
 //	1. presence  — does this account exist on this host?  (a USER fact: credentials,
-//	               session history, a quota snapshot we captured earlier)
+//	               session history, a quota reading we captured earlier)
 //	2. billing   — subscription (5h/7d windows) or API-key (pay-per-token, no window)
-//	3. snapshot  — the last-known quota reading + how fresh it is
+//	3. snapshot  — the last-known reading: its windows, when it was taken, where it
+//	               came from, and whether it can still be trusted
 //	4. health    — can we execute the CLI *right now*?  (an ENVIRONMENT fact)
 //
 // Only axis 1 may hide a provider. A failing probe on axis 4 degrades the card; it
@@ -36,7 +37,7 @@ const (
 
 // Presence evidence kinds (axis 1). Reported so the UI can distinguish "logged in"
 // from "only residual history" — an explicit logout removes credentials, and we must
-// not keep claiming the account is live just because a stale snapshot is on disk.
+// not keep claiming the account is live just because a stale reading is on disk.
 const (
 	EvidenceCredentials = "credentials" // an auth/credentials file exists
 	EvidenceSnapshot    = "snapshot"    // we hold a (possibly old) quota reading
@@ -48,6 +49,13 @@ const (
 	HealthNotInstalled       = "not_installed"        // nothing named like the CLI on PATH
 	HealthNotExecutable      = "not_executable"       // found, but cannot be executed (lost +x, bad interpreter)
 	HealthVersionCheckFailed = "version_check_failed" // executed, but `--version` errored
+	HealthNotImplemented     = "not_implemented"      // this runtime is not supported at all
+)
+
+// Stale reasons (axis 3).
+const (
+	StaleWindowRolled = "window_rolled" // every window it describes has since reset
+	StaleTooOld       = "too_old"       // no reset to check against, and it predates maxSnapshotAge
 )
 
 // QuotaWindow is one rolling rate-limit window (abtop model): 5h primary / 7d
@@ -62,21 +70,30 @@ type QuotaWindow struct {
 	RemainingPercent float64 `json:"remaining_percent"`
 	// ResetAt is the ISO-8601 time the window resets.
 	ResetAt string `json:"reset_at,omitempty"`
+	// Expired marks a window whose reset time has PASSED since this reading was taken. The
+	// counter has since rolled over, so UsedPercent/RemainingPercent are not merely old —
+	// they are certainly WRONG, and a UI must not paint them as a quantity. Expiry is
+	// per-window on purpose: a runtime's 5h window can roll while its 7d window stays
+	// perfectly valid, and condemning both would throw away a number that is still true.
+	Expired bool `json:"expired,omitempty"`
 }
 
-// SnapshotMeta describes WHEN the quota reading was taken and whether it can still
-// be trusted as current (axis 3). Absent (nil QuotaInfo.Snapshot) means we have never
-// captured a reading — render 「等待额度数据」, never a fabricated 0%/100%.
+// SnapshotMeta describes the reading behind the windows: when it was taken, WHERE it came
+// from, and whether it can still be read as current (axis 3). A nil QuotaInfo.Snapshot means
+// we have never captured a reading — render 「等待额度数据」, never a fabricated 0%/100%.
 type SnapshotMeta struct {
 	// CapturedAt is the ISO-8601 time the reading was taken.
 	CapturedAt string `json:"captured_at,omitempty"`
-	// AgeSeconds is how old the reading is at query time.
+	// AgeSeconds is how old the reading was at query time.
 	AgeSeconds int64 `json:"age_seconds"`
-	// Stale marks a reading that can no longer be read as current.
-	Stale bool `json:"stale"`
-	// StaleReason is "window_rolled" (the window it describes has since reset, so the
-	// used% is certainly wrong) or "too_old" (no reset time to check against, and the
-	// reading predates maxSnapshotAge).
+	// Source is where the reading came from: SourceHook | SourceRollout | SourceProbe.
+	// This is the field that answers "why did refreshing change nothing?" — a rollout reading
+	// only moves when the runtime chooses to write one, whereas a probe is us going and asking.
+	Source string `json:"source,omitempty"`
+	// Stale marks a reading that can no longer be read as current AS A WHOLE (every window it
+	// describes has rolled, or it is simply too old). A SINGLE rolled window does not set this —
+	// that lives on QuotaWindow.Expired, so a valid 7d number survives an expired 5h one.
+	Stale       bool   `json:"stale"`
 	StaleReason string `json:"stale_reason,omitempty"`
 }
 
@@ -103,11 +120,8 @@ type QuotaInfo struct {
 	// ── axis 2: billing mode
 	Billing string `json:"billing,omitempty"`
 
-	// ── axis 3: quota snapshot
-	// Plan is the subscription plan name (e.g. "Max5", "prolite") when the runtime reports it.
-	Plan string `json:"plan,omitempty"`
-	// Windows carries the last-known rolling-window usage (5h/7d). May come from a STALE
-	// snapshot — check Snapshot.Stale before presenting it as live.
+	// ── axis 3: the reading
+	Plan    string        `json:"plan,omitempty"`
 	Windows []QuotaWindow `json:"windows,omitempty"`
 	// Snapshot is nil when no reading has ever been captured.
 	Snapshot *SnapshotMeta `json:"snapshot,omitempty"`
@@ -124,13 +138,61 @@ type QuotaInfo struct {
 // itself a problem — but past this we stop implying the number is live.
 const maxSnapshotAge = 12 * time.Hour
 
-// QueryAllQuotas returns quota state for claude, codex, and gemini.
-func QueryAllQuotas() []QuotaInfo {
-	return []QuotaInfo{
-		queryClaudeQuota(),
-		queryCodexQuota(),
-		queryGeminiQuota(),
+// applyReading folds an observation into the info: windows, plan, billing, and the snapshot
+// metadata that says how far it can be trusted. The single place a Reading becomes UI truth.
+func (info *QuotaInfo) applyReading(r *Reading) {
+	if r == nil {
+		return
 	}
+	info.Plan = r.Plan
+	if r.Billing != "" {
+		info.Billing = r.Billing
+	}
+	info.Windows = r.Windows
+	info.Snapshot = newSnapshotMeta(r)
+}
+
+// newSnapshotMeta stamps a reading with its age, its provenance, and whether it survives.
+func newSnapshotMeta(r *Reading) *SnapshotMeta {
+	if r == nil || r.CapturedAt.IsZero() {
+		return nil
+	}
+	meta := &SnapshotMeta{
+		CapturedAt: r.CapturedAt.UTC().Format(time.RFC3339),
+		AgeSeconds: int64(time.Since(r.CapturedAt).Seconds()),
+		Source:     r.Source,
+	}
+	if meta.AgeSeconds < 0 {
+		meta.AgeSeconds = 0
+	}
+	if allExpired := markExpiredWindows(r.Windows); allExpired {
+		meta.Stale = true
+		meta.StaleReason = StaleWindowRolled
+		return meta
+	}
+	if time.Since(r.CapturedAt) > maxSnapshotAge {
+		meta.Stale = true
+		meta.StaleReason = StaleTooOld
+	}
+	return meta
+}
+
+// markExpiredWindows flags every window whose reset has already passed, and reports whether
+// ALL of them have (in which case the reading as a whole is worthless).
+func markExpiredWindows(windows []QuotaWindow) (allExpired bool) {
+	now := time.Now()
+	checked, expired := 0, 0
+	for i := range windows {
+		if windows[i].ResetAt == "" {
+			continue
+		}
+		checked++
+		if reset, err := time.Parse(time.RFC3339, windows[i].ResetAt); err == nil && reset.Before(now) {
+			windows[i].Expired = true
+			expired++
+		}
+	}
+	return checked > 0 && expired == checked
 }
 
 // probeCLI reports whether the named CLI can be executed right now (axis 4 ONLY).
@@ -163,133 +225,115 @@ func probeCLI(name string) RuntimeHealth {
 	return RuntimeHealth{OK: true, Version: strings.TrimSpace(out.String())}
 }
 
-// queryClaudeQuota assembles claude's four axes.
-//
-// Presence comes from account artifacts (credentials / captured snapshot / project
-// history) — NOT from the CLI probe. Real quota numbers come from the statusLine hook
-// drop file (the claude CLI exposes 5h/7d used% nowhere else); absent file → honest
-// 「等待额度数据」, never a fabricated number.
-func queryClaudeQuota() QuotaInfo {
+// ── claude ───────────────────────────────────────────────────────────────────
+
+type claudeProvider struct{}
+
+func (claudeProvider) Runtime() string { return "claude" }
+
+// CanProbe is false: claude exposes its 5h/7d usage ONLY as a field of the JSON it pipes to a
+// statusLine command. There is no endpoint to ask — the reading arrives when claude renders.
+func (claudeProvider) CanProbe() bool                { return false }
+func (claudeProvider) Probe(_ context.Context) error { return nil }
+
+// Query assembles claude's four axes. Presence comes from account artifacts (credentials /
+// captured reading / project history) — NOT from the CLI probe.
+func (claudeProvider) Query() QuotaInfo {
 	info := QuotaInfo{Runtime: "claude", Health: probeCLI("claude")}
 
-	rl, hasSnapshot := readClaudeRateLimits(claudeRateLimitsPath())
-	info.Evidence = claudePresenceEvidence(hasSnapshot)
+	reading := claudeHookReading()
+	info.Evidence = claudePresenceEvidence(reading != nil)
 	info.Present = len(info.Evidence) > 0
 	if !info.Present {
 		return info
 	}
 
-	if !hasSnapshot {
+	if reading == nil {
 		info.Billing = BillingUnknown
 		info.Note = claudeNoSnapshotNote(info.Evidence)
 		return info
 	}
 
-	capturedAt := snapshotTime(rl.CapturedAt, claudeRateLimitsPath())
-
-	// API-key billing: no subscription 5h/7d window exists by design. Report it
-	// explicitly so the chip files it under 「API 计费」 instead of an "expired" bar.
-	if rl.Source == "api" {
-		info.Billing = BillingAPI
-		info.Snapshot = newSnapshotMeta(capturedAt, nil)
+	info.applyReading(reading)
+	if info.Billing == BillingAPI {
 		info.Note = "API 计费会话 · 按量付费（无订阅额度窗口）"
-		return info
+	} else {
+		info.Note = "实时额度来自 statusLine hook"
 	}
-
-	info.Billing = BillingSubscription
-	if q, ok := claudeQuotaWindow("5h", rl.FiveHour); ok {
-		info.Windows = append(info.Windows, q)
-	}
-	if q, ok := claudeQuotaWindow("7d", rl.SevenDay); ok {
-		info.Windows = append(info.Windows, q)
-	}
-	info.Snapshot = newSnapshotMeta(capturedAt, info.Windows)
-	info.Note = "实时额度来自 statusLine hook"
 	return info
 }
 
-// queryCodexQuota assembles codex's four axes. Real quota comes from the newest
-// rollout transcript's last rate_limits object (same source abtop reads).
-func queryCodexQuota() QuotaInfo {
+// ── codex ────────────────────────────────────────────────────────────────────
+
+type codexProvider struct{}
+
+func (codexProvider) Runtime() string { return "codex" }
+
+// CanProbe is true when the account is OAuth-authenticated: only then is there a token to ask
+// with. An API-key account has no subscription quota to report in the first place.
+func (codexProvider) CanProbe() bool {
+	_, err := codexAccessToken()
+	return err == nil
+}
+
+func (codexProvider) Probe(ctx context.Context) error { return probeCodexQuota(ctx) }
+
+// Query assembles codex's four axes from the freshest available reading: the rollout codex
+// writes as it works, or the drop file our probe writes when the user asks.
+func (codexProvider) Query() QuotaInfo {
 	info := QuotaInfo{Runtime: "codex", Health: probeCLI("codex")}
 
-	rl, capturedAt, hasSnapshot := latestCodexRateLimits(codexSessionsDir())
-	info.Evidence = codexPresenceEvidence(hasSnapshot)
+	reading := newestReading(codexRolloutReading(), codexProbeReading())
+	info.Evidence = codexPresenceEvidence(reading != nil)
 	info.Present = len(info.Evidence) > 0
 	if !info.Present {
 		return info
 	}
 
-	// Billing is knowable from the auth file's SHAPE (an API key vs an OAuth token set)
-	// — we look at which field is populated, never at its value.
-	info.Billing = codexBilling(hasSnapshot)
+	// Billing is knowable from the auth file's SHAPE (an API key vs an OAuth token set) — we
+	// look at which field is populated, never at its value.
+	info.Billing = codexBilling(reading != nil)
 
-	if !hasSnapshot {
+	if reading == nil {
 		if info.Billing == BillingAPI {
 			info.Note = "API 计费会话 · 按量付费（无订阅额度窗口）"
 		} else {
-			info.Note = "暂无 rollout 额度记录"
+			info.Note = "暂无额度记录（codex 尚未上报）"
 		}
 		return info
 	}
 
-	info.Plan = rl.PlanType
-	if q, ok := codexQuotaWindow(rl.Primary); ok {
-		info.Windows = append(info.Windows, q)
+	info.applyReading(reading)
+	switch reading.Source {
+	case SourceProbe:
+		info.Note = "账号额度 · 实时查询"
+	default:
+		info.Note = "账号额度来自 rollout transcript"
 	}
-	if q, ok := codexQuotaWindow(rl.Secondary); ok {
-		info.Windows = append(info.Windows, q)
-	}
-	info.Snapshot = newSnapshotMeta(capturedAt, info.Windows)
-	info.Note = "账号额度来自 rollout transcript"
 	return info
 }
 
-// queryGeminiQuota always reports absent; Gemini quota parsing is not supported, and
-// not_implemented must never masquerade as a supported-but-empty provider.
-func queryGeminiQuota() QuotaInfo {
+// ── gemini ───────────────────────────────────────────────────────────────────
+
+type geminiProvider struct{}
+
+func (geminiProvider) Runtime() string               { return "gemini" }
+func (geminiProvider) CanProbe() bool                { return false }
+func (geminiProvider) Probe(_ context.Context) error { return nil }
+
+// Query always reports absent: Gemini quota parsing is not supported, and not_implemented must
+// never masquerade as a supported-but-empty provider.
+func (geminiProvider) Query() QuotaInfo {
 	return QuotaInfo{
 		Runtime: "gemini",
 		Present: false,
-		Health:  RuntimeHealth{OK: false, Reason: "not_implemented"},
+		Health:  RuntimeHealth{OK: false, Reason: HealthNotImplemented},
 		Note:    "Gemini quota inspection is not yet supported",
 	}
 }
 
-// newSnapshotMeta stamps a reading with its age and decides whether it may still be
-// presented as current. A window whose reset time has already passed is definitively
-// stale — the runtime has since rolled it over, so the used% we hold is wrong.
-func newSnapshotMeta(capturedAt time.Time, windows []QuotaWindow) *SnapshotMeta {
-	if capturedAt.IsZero() {
-		return nil
-	}
-	meta := &SnapshotMeta{
-		CapturedAt: capturedAt.UTC().Format(time.RFC3339),
-		AgeSeconds: int64(time.Since(capturedAt).Seconds()),
-	}
-	if meta.AgeSeconds < 0 {
-		meta.AgeSeconds = 0
-	}
-	now := time.Now()
-	for _, w := range windows {
-		if w.ResetAt == "" {
-			continue
-		}
-		if reset, err := time.Parse(time.RFC3339, w.ResetAt); err == nil && reset.Before(now) {
-			meta.Stale = true
-			meta.StaleReason = "window_rolled"
-			return meta
-		}
-	}
-	if time.Since(capturedAt) > maxSnapshotAge {
-		meta.Stale = true
-		meta.StaleReason = "too_old"
-	}
-	return meta
-}
-
-// claudeNoSnapshotNote explains the empty-quota case in the user's terms: logged in but
-// the opt-in hook has not produced a reading yet, versus only residual history on disk.
+// claudeNoSnapshotNote explains the empty-quota case in the user's terms: logged in but the
+// opt-in hook has not produced a reading yet, versus only residual history on disk.
 func claudeNoSnapshotNote(evidence []string) string {
 	if hasEvidence(evidence, EvidenceCredentials) {
 		return "已登录 · 等待额度数据（需启用 statusLine hook）"
