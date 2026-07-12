@@ -69,6 +69,12 @@ type rawLine struct {
 	Timestamp string          `json:"timestamp"`
 	AITitle   string          `json:"aiTitle"`
 	Message   json.RawMessage `json:"message"`
+	// Subtype discriminates `system` lines. The one that matters to a reader is
+	// `compact_boundary` (claude auto-compacted the context — from here on the agent
+	// cannot see the earlier conversation, which is part of the run's causal story).
+	// Verified subtypes in a real transcript: compact_boundary, local_command,
+	// stop_hook_summary, away_summary, scheduled_task_fire.
+	Subtype string `json:"subtype"`
 }
 
 // rawMessage is the inner `message` object for user/assistant lines.
@@ -86,6 +92,21 @@ type rawMessage struct {
 	// message.model). Surfaced onto the turn's usage block + tr.Meta so the overview
 	// renders the model name + derives cost — instead of an honest-but-blank「—」.
 	Model string `json:"model"`
+	// StopReason is claude's yield fact: `end_turn` = the model handed control back
+	// to the human (the run is over); `tool_use` = it is still working through a tool
+	// loop. Verified distribution on a real 60 MB transcript: tool_use 1066 /
+	// end_turn 53 / null 2. This is what lets the AgentRun projector tell a mid-run
+	// steer apart from a fresh human intent — no time-gap guessing.
+	StopReason string `json:"stop_reason"`
+}
+
+// interruptMarker matches the user-role line claude writes when the human hits ESC
+// (`[Request interrupted by user]`, and the tool-permission variant). It is NOT a
+// human message — it is the runtime's abort fact. Verified: 7 occurrences on the
+// real transcript; treating them as user bubbles both fabricated rounds AND hid the
+// interruption, which is why they become Turn.Terminal = aborted instead.
+func isInterruptMarker(s string) bool {
+	return strings.HasPrefix(strings.TrimSpace(s), "[Request interrupted by user")
 }
 
 // contentPart is one typed element of a message.content array.

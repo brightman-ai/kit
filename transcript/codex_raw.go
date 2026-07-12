@@ -300,5 +300,12 @@ func isCodexNoise(s string) bool {
 		strings.HasPrefix(s, "<permissions instructions>") ||
 		strings.HasPrefix(s, "<collaboration_mode>") ||
 		strings.HasPrefix(s, "<user_instructions>") ||
-		strings.HasPrefix(s, "<INSTRUCTIONS>")
+		strings.HasPrefix(s, "<INSTRUCTIONS>") ||
+		// Verified on a real rollout: codex re-injects its OWN interruption notice and the
+		// expanded skill body as user-role messages (`<turn_aborted>` ×7, `<skill>` ×1).
+		// They are runtime bookkeeping, not human input — counting them as user bubbles both
+		// invented rounds and mis-classified the human's next line as a mid-run steer.
+		strings.HasPrefix(s, "<turn_aborted>") ||
+		strings.HasPrefix(s, "<skill>") ||
+		strings.HasPrefix(s, "<name>")
 }

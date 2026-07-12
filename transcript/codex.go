@@ -46,13 +46,7 @@ const cwdIndexTTL = 5 * time.Second
 
 // NewCodexSource roots at ~/.codex (override via DW_CODEX_HOME for tests).
 func NewCodexSource() *CodexSource {
-	root := strings.TrimSpace(os.Getenv("DW_CODEX_HOME"))
-	if root == "" {
-		if home, err := os.UserHomeDir(); err == nil {
-			root = filepath.Join(home, ".codex")
-		}
-	}
-	return &CodexSource{Root: root}
+	return &CodexSource{Root: CodexHome()} // root resolution: roots.go (single source)
 }
 
 func (s *CodexSource) Kind() string { return KindCodex }
@@ -62,35 +56,18 @@ func (s *CodexSource) sessionsDir() string {
 	return filepath.Join(s.Root, "sessions")
 }
 
-// rolloutFiles walks <Root>/sessions/**/ collecting every rollout-*.jsonl path.
+// rolloutFiles collects every rollout-*.jsonl under <Root>/sessions/**, newest first.
 // A missing sessions dir is an honest empty list, never an error (an unparsed or
 // absent runtime must not degrade the whole fleet).
 func (s *CodexSource) rolloutFiles() ([]string, error) {
-	root := s.sessionsDir()
-	if _, err := os.Stat(root); err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	var paths []string
-	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return nil // tolerate unreadable subtrees; keep walking
-		}
-		if d.IsDir() {
-			return nil
-		}
-		name := d.Name()
-		if strings.HasPrefix(name, "rollout-") && strings.HasSuffix(name, ".jsonl") {
-			paths = append(paths, path)
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	return paths, nil
+	return NewestFiles(s.sessionsDir(), RolloutPrefix, JSONLSuffix, 0), nil // discovery: scan.go
+}
+
+// NewestRollouts returns the n most recently written rollout transcripts, newest first.
+// Callers that only want "what happened lately" (quota readings, live state) should bound
+// themselves this way rather than walking the whole tree.
+func (s *CodexSource) NewestRollouts(n int) []string {
+	return NewestFiles(s.sessionsDir(), RolloutPrefix, JSONLSuffix, n)
 }
 
 // ListSessions scans every rollout-*.jsonl, keeps those whose session_meta.cwd
@@ -251,6 +228,7 @@ func (s *CodexSource) scanMeta(path string) (SessionMeta, string, bool) {
 		id, cwd, firstUser string
 		firstTS, lastTS    time.Time
 		userTurns          int
+		tasksStarted       int
 	)
 
 	sc := bufio.NewScanner(f)
@@ -274,6 +252,13 @@ func (s *CodexSource) scanMeta(path string) (SessionMeta, string, bool) {
 				if ts := parseCodexTime(m.Timestamp); !ts.IsZero() {
 					firstTS = ts
 				}
+			}
+		case "event_msg":
+			// A task_started IS a submitted round. Counting user messages instead inflated
+			// the list count with mid-run steers (real rollout: 16 user messages vs 10
+			// actual rounds) — the same number the transcript view derives from AgentRuns.
+			if line.payloadType() == "task_started" {
+				tasksStarted++
 			}
 		case "response_item":
 			if line.payloadType() != "message" {
@@ -316,7 +301,12 @@ func (s *CodexSource) scanMeta(path string) (SessionMeta, string, bool) {
 			}
 		}
 	}
+	// Prefer the runtime's own round fact; fall back to user messages for older rollouts
+	// that predate the lifecycle events (never worse than before).
 	meta.TurnCount = userTurns
+	if tasksStarted > 0 {
+		meta.TurnCount = tasksStarted
+	}
 	storeMetaCache(path, st, meta, cwd, true)
 	return meta, cwd, true
 }
@@ -349,6 +339,20 @@ func (s *CodexSource) LoadTranscript(ctx context.Context, ref SessionRef) (*Tran
 	// all-zero session stays an honest unknown (no fabricated zeros).
 	var totalIn, totalOut, totalCacheRead int
 	var sawUsage bool
+	// Run-lifecycle state, from codex's OWN facts (this is what makes intent-vs-steer
+	// decidable instead of guessable): `event_msg/task_started` opens a task; the user
+	// message that drives it is the intent; any user message arriving while that task is
+	// still open was typed INTO the running turn (a steer). Real rollout: task_started ×10
+	// vs user_message ×16 → 10 intents + 6 steers, no heuristics, no time gaps.
+	// (A rollout with no lifecycle events at all degrades to intent-per-message, which is
+	// exactly the old behavior — never worse.)
+	taskOpen := false
+	awaitingIntent := false
+	// The model in force (turn_context) — a session can switch models mid-conversation
+	// (/model). Stamping it onto each usage delta is what lets a run's usage be attributed
+	// to the model that actually produced it.
+	curModel := ""
+	lineSeq := 0
 
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 1<<20), 64<<20)
@@ -357,11 +361,19 @@ func (s *CodexSource) LoadTranscript(ctx context.Context, ref SessionRef) (*Tran
 		if json.Unmarshal(sc.Bytes(), &line) != nil {
 			continue
 		}
+		lineSeq++
 		at := line.time()
 		switch line.Type {
 		case "session_meta":
 			if m := line.asSessionMeta(); m != nil {
 				cwd = m.Cwd
+			}
+		case "turn_context":
+			if tc := line.asTurnContext(); tc != nil && tc.Model != "" {
+				curModel = tc.Model
+				if _, ok := tr.Meta["model"]; !ok {
+					tr.Meta["model"] = tc.Model
+				}
 			}
 		case "response_item":
 			switch line.payloadType() {
@@ -379,15 +391,26 @@ func (s *CodexSource) LoadTranscript(ctx context.Context, ref SessionRef) (*Tran
 					if firstUser == "" {
 						firstUser = txt
 					}
+					// Intent vs steer — decided by codex's task lifecycle, never guessed:
+					// the message that drives a just-started task is the intent; one typed
+					// while that task is still running was queued into it.
+					kind := InputIntent
+					if taskOpen && !awaitingIntent {
+						kind = InputAmendment
+					}
+					awaitingIntent = false
+					if kind == InputIntent {
+						taskOpen = true // a rollout with no lifecycle events still tracks runs
+					}
 					tr.Turns = append(tr.Turns, Turn{
-						Index: len(tr.Turns), Role: "user", At: tsPtr(at),
-						Blocks: []Block{{Type: BlockUser, Text: txt}},
+						Index: len(tr.Turns), Role: "user", At: tsPtr(at), InputKind: kind,
+						Blocks: []Block{{Type: BlockUser, Text: txt, EventID: "l" + itoa(lineSeq)}},
 					})
 				case "assistant":
 					if txt := m.text(); txt != "" {
 						tr.Turns = append(tr.Turns, Turn{
 							Index: len(tr.Turns), Role: "assistant", At: tsPtr(at),
-							Blocks: []Block{{Type: BlockText, Text: txt}},
+							Blocks: []Block{{Type: BlockText, Text: txt, EventID: "l" + itoa(lineSeq)}},
 						})
 					}
 				}
@@ -396,7 +419,7 @@ func (s *CodexSource) LoadTranscript(ctx context.Context, ref SessionRef) (*Tran
 					if txt := r.text(); txt != "" {
 						tr.Turns = append(tr.Turns, Turn{
 							Index: len(tr.Turns), Role: "assistant", At: tsPtr(at),
-							Blocks: []Block{{Type: BlockThinking, Text: txt}},
+							Blocks: []Block{{Type: BlockThinking, Text: txt, EventID: "l" + itoa(lineSeq)}},
 						})
 					}
 				}
@@ -421,37 +444,86 @@ func (s *CodexSource) LoadTranscript(ctx context.Context, ref SessionRef) (*Tran
 				}
 			case "function_call_output", "custom_tool_call_output":
 				if o := line.asFunctionOutput(); o != nil {
-					if loc, ok := pending[o.CallID]; ok {
-						blk := &tr.Turns[loc.t].Blocks[loc.b]
-						blk.ToolResult = o.Output
-						delete(pending, o.CallID)
+					loc, ok := pending[o.CallID]
+					if !ok {
+						// Orphan result (call not in this rollout) → keep it visible +
+						// counted, never silently dropped.
+						tr.Turns = append(tr.Turns, Turn{
+							Index: len(tr.Turns), Role: "assistant", At: tsPtr(at),
+							Blocks: []Block{{
+								Type: BlockTool, EventID: o.CallID, ToolUseID: o.CallID,
+								ToolResult: o.Output, ResultSeen: true, Orphan: true,
+							}},
+						})
+						continue
 					}
+					blk := &tr.Turns[loc.t].Blocks[loc.b]
+					blk.ToolResult = o.Output
+					blk.ResultSeen = true // it actually completed (vs. cut off by an abort)
+					delete(pending, o.CallID)
 				}
 			}
 		case "event_msg":
+			switch line.payloadType() {
+			// Run lifecycle — codex states the AgentRun boundary explicitly (real 16 MB
+			// rollout: task_started 10 / task_complete 3 / turn_aborted 6). This is the
+			// fact that makes intent-vs-steer decidable; ignoring it (as the first cut of
+			// this design did) forces the projector to guess from "is a run open?", and a
+			// single missing task_complete then swallows the next independent request into
+			// the previous round.
+			case "task_started":
+				taskOpen = true
+				awaitingIntent = true // the next user message is this task's intent
+			case "task_complete":
+				stampCodexTerminal(tr, TerminalEndTurn, at)
+				taskOpen, awaitingIntent = false, false
+			case "turn_aborted":
+				stampCodexTerminal(tr, TerminalAborted, at)
+				taskOpen, awaitingIntent = false, false
+
+			// Automatic context compaction — part of the run's causal story (Codex GUI
+			// shows it as「上下文已自动压缩」). It is a segment, never a conversation turn.
+			case "context_compacted":
+				tr.Turns = append(tr.Turns, Turn{
+					Index: len(tr.Turns), Role: "assistant", At: tsPtr(at),
+					Blocks: []Block{{Type: BlockCompaction, Text: "上下文已自动压缩"}},
+				})
+
 			// codex carries token usage out-of-band on event_msg/token_count
 			// (per-turn last_token_usage delta). Surface it as a usage block in
 			// flow order + sum into Meta — same shape as claude/deepwork so the
-			// @ce UsageFooter is runtime-agnostic.
-			if line.payloadType() != "token_count" {
-				continue
+			// @ce UsageFooter is runtime-agnostic. The AgentRun projector absorbs
+			// these into the run's single aggregate (they are not visible segments).
+			case "token_count":
+				tc := line.asTokenCount()
+				if tc == nil || tc.Info == nil {
+					continue // rate-limit-only line (info=null) → no usage payload
+				}
+				u := tc.Info.LastTokenUsage.usageMap()
+				if u == nil {
+					continue // all-zero turn → honest skip
+				}
+				// Attribute the delta to the model that actually produced it (a session
+				// can /model mid-run; turn_context is the SSOT for which one was in force).
+				if curModel != "" {
+					u["model"] = curModel
+				}
+				tr.Turns = append(tr.Turns, Turn{
+					Index: len(tr.Turns), Role: "assistant", At: tsPtr(at),
+					Blocks: []Block{{Type: BlockUsage, Usage: u}},
+				})
+				totalIn += intField(u, "input_tokens")
+				totalOut += intField(u, "output_tokens")
+				totalCacheRead += intField(u, "cache_read_input_tokens")
+				sawUsage = true
+
+				// agent_message / patch_apply_end / web_search_end are event-stream
+				// DUPLICATES of the response_item chain this loader already reads
+				// (assistant text / apply_patch / web search). Consuming them too would
+				// double-count every tool and every answer. thread_settings_applied has
+				// no user-visible semantics. All intentionally ignored — the response_item
+				// chain is the single source.
 			}
-			tc := line.asTokenCount()
-			if tc == nil || tc.Info == nil {
-				continue // rate-limit-only line (info=null) → no usage payload
-			}
-			u := tc.Info.LastTokenUsage.usageMap()
-			if u == nil {
-				continue // all-zero turn → honest skip
-			}
-			tr.Turns = append(tr.Turns, Turn{
-				Index: len(tr.Turns), Role: "assistant", At: tsPtr(at),
-				Blocks: []Block{{Type: BlockUsage, Usage: u}},
-			})
-			totalIn += intField(u, "input_tokens")
-			totalOut += intField(u, "output_tokens")
-			totalCacheRead += intField(u, "cache_read_input_tokens")
-			sawUsage = true
 		}
 	}
 
@@ -466,6 +538,62 @@ func (s *CodexSource) LoadTranscript(ctx context.Context, ref SessionRef) (*Tran
 		"codex session "+shortID(ref.ID),
 	)
 	return tr, nil
+}
+
+// stampCodexTerminal records codex's run-lifecycle fact on the last assistant turn,
+// which is what the (runtime-agnostic) AgentRun projector reads to close a run.
+// codex emits task_complete / turn_aborted as standalone events AFTER the assistant
+// activity they terminate, so the fact attaches backwards. When a run produced no
+// assistant turn at all (an aborted-before-anything task), a block-less marker turn
+// carries it — the run must still close honestly rather than swallow the next human
+// message as a steer.
+func stampCodexTerminal(tr *Transcript, terminal string, at time.Time) {
+	for i := len(tr.Turns) - 1; i >= 0; i-- {
+		if tr.Turns[i].Role != "assistant" {
+			break // hit the human line that opened this run → no assistant turn to stamp
+		}
+		if tr.Turns[i].Terminal != "" {
+			return // already terminal (duplicate lifecycle event) → idempotent
+		}
+		tr.Turns[i].Terminal = terminal
+		// On a COMPLETED task, the last assistant message text is the run's answer — a
+		// domain fact from the lifecycle, not "whatever text happens to be last": an
+		// aborted task's trailing narration must NOT get promoted to an answer, and a
+		// notification arriving after the answer must not demote it.
+		if terminal == TerminalEndTurn {
+			markCodexFinalText(tr, i)
+		}
+		return
+	}
+	tr.Turns = append(tr.Turns, Turn{
+		Index: len(tr.Turns), Role: "assistant", At: tsPtr(at), Terminal: terminal,
+	})
+}
+
+// markCodexFinalText flags the trailing assistant TEXT of the completed task as the run's
+// FinalAnswer. codex writes its answer as its own response_item/message, so the search
+// walks back over the terminal turn and any trailing non-text bookkeeping turns (usage,
+// compaction) — stopping at the first tool/reasoning turn, which is process, not answer.
+func markCodexFinalText(tr *Transcript, from int) {
+	for i := from; i >= 0; i-- {
+		t := &tr.Turns[i]
+		if t.Role != "assistant" {
+			return
+		}
+		marked := false
+		for bi := range t.Blocks {
+			switch t.Blocks[bi].Type {
+			case BlockText:
+				t.Blocks[bi].Final = true
+				marked = true
+			case BlockTool, BlockAgent, BlockThinking:
+				return // process reached → everything before it is process
+			}
+		}
+		if marked {
+			return
+		}
+	}
 }
 
 // appendCodexToolCall appends a tool_use block as its own assistant turn and

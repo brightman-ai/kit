@@ -29,13 +29,7 @@ type ClaudeSource struct {
 // NewClaudeSource builds a ClaudeSource rooted at ~/.claude/projects (or the
 // override in DW_CLAUDE_PROJECTS, useful for tests/sandboxes).
 func NewClaudeSource() *ClaudeSource {
-	root := strings.TrimSpace(os.Getenv("DW_CLAUDE_PROJECTS"))
-	if root == "" {
-		if home, err := os.UserHomeDir(); err == nil {
-			root = filepath.Join(home, ".claude", "projects")
-		}
-	}
-	return &ClaudeSource{Root: root}
+	return &ClaudeSource{Root: ClaudeProjectsRoot()} // root resolution: roots.go (single source)
 }
 
 func (s *ClaudeSource) Kind() string { return KindClaude }
@@ -160,11 +154,20 @@ func (s *ClaudeSource) scanMeta(path, id string) SessionMeta {
 			if line.IsMeta {
 				continue // skip local-command / slash-command meta echoes
 			}
-			if txt := line.userText(); txt != "" && !isCommandEcho(txt) {
-				userTurns++
-				if firstUser == "" {
-					firstUser = txt
-				}
+			txt := line.userText()
+			if txt == "" || isCommandEcho(txt) {
+				continue
+			}
+			// The list's turn_count must mean the same thing as the round count the
+			// transcript view shows (an independent human intent). A task-notification and
+			// an ESC interrupt marker are runtime bookkeeping written on user-role lines —
+			// counting them made the list claim rounds the human never sent.
+			if isInterruptMarker(txt) || parseTaskNotification(txt) != nil {
+				continue
+			}
+			userTurns++
+			if firstUser == "" {
+				firstUser = txt
 			}
 		}
 	}
@@ -206,6 +209,13 @@ func (s *ClaudeSource) LoadTranscript(ctx context.Context, ref SessionRef) (*Tra
 	// index + message.id; a match folds blocks in instead of spawning another bubble.
 	lastAsstIdx := -1
 	lastAsstMsgID := ""
+	// runOpen = the model is still working on the current human intent (its last message
+	// said stop_reason=tool_use, no end_turn / interrupt since). It is what makes a human
+	// line's meaning DECIDABLE: while open, a human line is a queued steer (the runtime
+	// records exactly that as `queue-operation/enqueue` — 72 in the real transcript);
+	// once yielded, the next human line is a new intent. The projector never re-derives
+	// this — the adapter states it on Turn.InputKind.
+	runOpen := false
 
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 1<<20), 32<<20)
@@ -220,16 +230,28 @@ func (s *ClaudeSource) LoadTranscript(ctx context.Context, ref SessionRef) (*Tra
 				aiTitle = line.AITitle
 			}
 			continue
+		case "system":
+			// claude's own auto-compaction boundary — part of the run's causal story
+			// (from here on the agent cannot see the earlier context), so it is a visible
+			// process segment. Every other system subtype is UI metadata.
+			if line.Subtype == "compact_boundary" {
+				tr.Turns = append(tr.Turns, Turn{
+					Index: len(tr.Turns), Role: "assistant", At: tsPtr(line.time()),
+					Blocks: []Block{{Type: BlockCompaction, Text: "上下文已自动压缩"}},
+				})
+			}
+			continue
 		case "user":
 			if line.IsMeta {
 				continue
 			}
-			s.appendUserTurn(tr, &line, pending)
+			s.appendUserTurn(tr, &line, pending, &runOpen)
 		case "assistant":
-			s.appendAssistantTurn(tr, &line, pending, &totalIn, &totalOut, &totalCacheRead, &lastAsstIdx, &lastAsstMsgID)
+			s.appendAssistantTurn(tr, &line, pending, &totalIn, &totalOut, &totalCacheRead, &lastAsstIdx, &lastAsstMsgID, &runOpen)
 		default:
-			// mode / permission-mode / last-prompt / system / attachment /
-			// file-history-snapshot / queue-operation → metadata, skipped.
+			// mode / permission-mode / last-prompt / attachment / file-history-snapshot /
+			// queue-operation → metadata (queue-operation's payload is re-delivered as a
+			// normal user line when it dequeues, so consuming it here would double-count).
 			continue
 		}
 	}
@@ -243,7 +265,7 @@ func (s *ClaudeSource) LoadTranscript(ctx context.Context, ref SessionRef) (*Tra
 
 // appendUserTurn turns a user line into either a tool_result attachment (when
 // its content carries tool_result blocks) and/or a user_bubble turn.
-func (s *ClaudeSource) appendUserTurn(tr *Transcript, line *rawLine, pending map[string]toolLoc) {
+func (s *ClaudeSource) appendUserTurn(tr *Transcript, line *rawLine, pending map[string]toolLoc, runOpen *bool) {
 	at := line.time()
 	parts := line.contentParts()
 
@@ -251,20 +273,34 @@ func (s *ClaudeSource) appendUserTurn(tr *Transcript, line *rawLine, pending map
 	var bubbleText strings.Builder
 	for _, p := range parts {
 		if p.Type == "tool_result" {
-			if loc, ok := pending[p.ToolUseID]; ok {
-				blk := &tr.Turns[loc.t].Blocks[loc.b]
-				blk.ToolResult = p.resultText()
-				blk.IsError = p.IsError
-				// Agent subflow: derive honest end-to-end duration from the
-				// tool_use→tool_result timestamp delta (the only subagent timing
-				// available from the parent jsonl). Tokens stay 0 (→ "—").
-				if blk.Type == BlockAgent && !loc.useAt.IsZero() && !at.IsZero() {
-					if d := at.Sub(loc.useAt).Milliseconds(); d > 0 {
-						blk.DurationMs = int(d)
-					}
-				}
-				delete(pending, p.ToolUseID)
+			loc, ok := pending[p.ToolUseID]
+			if !ok {
+				// Orphan result (its call is not in this transcript — truncated file,
+				// resumed session). Keep it VISIBLE + counted rather than dropping content
+				// on the floor; the projector reports it in RunDiagnostic.
+				tr.Turns = append(tr.Turns, Turn{
+					Index: len(tr.Turns), Role: "assistant", At: tsPtr(at),
+					Blocks: []Block{{
+						Type: BlockTool, EventID: p.ToolUseID, ToolUseID: p.ToolUseID,
+						ToolResult: p.resultText(), IsError: p.IsError,
+						ResultSeen: true, Orphan: true,
+					}},
+				})
+				continue
 			}
+			blk := &tr.Turns[loc.t].Blocks[loc.b]
+			blk.ToolResult = p.resultText()
+			blk.IsError = p.IsError
+			blk.ResultSeen = true // the call actually completed (vs. one cut off by an interrupt)
+			// Agent subflow: derive honest end-to-end duration from the
+			// tool_use→tool_result timestamp delta (the only subagent timing
+			// available from the parent jsonl). Tokens stay 0 (→ "—").
+			if blk.Type == BlockAgent && !loc.useAt.IsZero() && !at.IsZero() {
+				if d := at.Sub(loc.useAt).Milliseconds(); d > 0 {
+					blk.DurationMs = int(d)
+				}
+			}
+			delete(pending, p.ToolUseID)
 			continue
 		}
 		if p.Type == "text" && p.Text != "" {
@@ -286,13 +322,32 @@ func (s *ClaudeSource) appendUserTurn(tr *Transcript, line *rawLine, pending map
 		return
 	}
 
+	// ESC interrupt: the runtime's abort fact, not a human message. Stamp it onto the
+	// open assistant turn (Terminal=aborted) so the AgentRun projector closes the run
+	// honestly — and emit NO user bubble (it never was one). Without this the marker
+	// both invented a round and left the run looking like it was still working, so the
+	// human's post-ESC retype got mis-bucketed as a mid-run steer.
+	if isInterruptMarker(text) {
+		for i := len(tr.Turns) - 1; i >= 0; i-- {
+			if tr.Turns[i].Role == "assistant" {
+				if tr.Turns[i].Terminal == "" { // never overwrite an existing yield fact
+					tr.Turns[i].Terminal = TerminalAborted
+				}
+				break
+			}
+		}
+		*runOpen = false // the run is over → the human's next line is a NEW intent
+		return
+	}
+
 	// task-notification: a runtime system event (background task / agent done),
 	// NOT a real user message. Surface it as a compact task-notification block
 	// (its own turn) instead of letting it fall through to a full-width bubble.
 	if tn := parseTaskNotification(text); tn != nil {
-		turn := Turn{Index: len(tr.Turns), Role: "user", At: tsPtr(at)}
+		turn := Turn{Index: len(tr.Turns), Role: "user", At: tsPtr(at), InputKind: InputSystem}
 		turn.Blocks = append(turn.Blocks, Block{
 			Type:         BlockTaskNotification,
+			EventID:      tn.TaskID,
 			NotifyStatus: tn.Status,
 			TaskID:       tn.TaskID,
 			Text:         tn.Summary,
@@ -301,20 +356,33 @@ func (s *ClaudeSource) appendUserTurn(tr *Transcript, line *rawLine, pending map
 		return
 	}
 
-	turn := Turn{Index: len(tr.Turns), Role: "user", At: tsPtr(at)}
+	// The human line's MEANING, stated by the adapter (never guessed downstream): while
+	// the model is still in its tool loop, a typed message is queued INTO that run (a
+	// steer); once it has yielded, the next message opens a new round.
+	kind := InputIntent
+	if *runOpen {
+		kind = InputAmendment
+	} else {
+		*runOpen = true
+	}
+	turn := Turn{Index: len(tr.Turns), Role: "user", At: tsPtr(at), InputKind: kind}
 	turn.Blocks = append(turn.Blocks, Block{Type: BlockUser, Text: text})
 	tr.Turns = append(tr.Turns, turn)
 }
 
 // appendAssistantTurn parses an assistant line into a turn of typed blocks and
 // registers any tool_use ids so their results can be back-attached.
-func (s *ClaudeSource) appendAssistantTurn(tr *Transcript, line *rawLine, pending map[string]toolLoc, totalIn, totalOut, totalCacheRead *int, lastAsstIdx *int, lastAsstMsgID *string) {
+func (s *ClaudeSource) appendAssistantTurn(tr *Transcript, line *rawLine, pending map[string]toolLoc, totalIn, totalOut, totalCacheRead *int, lastAsstIdx *int, lastAsstMsgID *string, runOpen *bool) {
 	at := line.time()
 	m := line.msg()
 	msgID := ""
 	if m != nil {
 		msgID = m.ID
 	}
+	// The yield fact, read ONCE here: end_turn means the model handed control back to the
+	// human → this iteration is the run's terminal one, so its text IS the answer (that is
+	// a domain fact, not "the last text block we happened to see").
+	yields := m != nil && (m.StopReason == "end_turn" || m.StopReason == "stop_sequence")
 
 	// Coalesce: one claude assistant message's blocks arrive as SEPARATE jsonl lines
 	// sharing message.id (可跨中间的 tool_result user 行 → 见 219 例非连续), and each
@@ -339,17 +407,24 @@ func (s *ClaudeSource) appendAssistantTurn(tr *Transcript, line *rawLine, pendin
 	}
 
 	for _, p := range line.contentParts() {
+		// Stable identity from the SOURCE event (message id + ordinal), so a reload
+		// reproduces the same segment ids and the user's expand/collapse choices stay bound
+		// to the same segments.
+		eventID := msgID + "#" + itoa(len(turn.Blocks))
 		switch p.Type {
 		case "text":
 			if strings.TrimSpace(p.Text) != "" {
-				turn.Blocks = append(turn.Blocks, Block{Type: BlockText, Text: p.Text})
+				turn.Blocks = append(turn.Blocks, Block{
+					Type: BlockText, Text: p.Text, EventID: eventID,
+					Final: yields, // terminal iteration's text = the run's answer
+				})
 			}
 		case "thinking":
 			if strings.TrimSpace(p.Thinking) != "" {
-				turn.Blocks = append(turn.Blocks, Block{Type: BlockThinking, Text: p.Thinking})
+				turn.Blocks = append(turn.Blocks, Block{Type: BlockThinking, Text: p.Thinking, EventID: eventID})
 			}
 		case "tool_use":
-			blk := Block{ToolName: p.Name, ToolUseID: p.ID, ToolInput: p.Input}
+			blk := Block{ToolName: p.Name, ToolUseID: p.ID, ToolInput: p.Input, EventID: p.ID}
 			if p.Name == "Agent" {
 				// Agent tool_use = subagent dispatch → AgentBlock subflow.
 				blk.Type = BlockAgent
@@ -384,9 +459,28 @@ func (s *ClaudeSource) appendAssistantTurn(tr *Transcript, line *rawLine, pendin
 		*totalCacheRead += intField(u, "cache_read_input_tokens")
 	}
 
-	// A brand-new turn that produced nothing renderable → drop it (preserve prior behavior).
+	// Yield fact (AgentRun boundary): end_turn closes the run; tool_use means the loop
+	// continues. Split lines of one message repeat stop_reason → merging is idempotent.
+	if yields {
+		turn.Terminal = TerminalEndTurn
+		*runOpen = false // yielded → the human's next line opens a NEW round
+	}
+
+	// A brand-new turn that produced nothing renderable → drop it (preserve prior
+	// behavior). Its yield fact must NOT die with it: hand the terminal to the last
+	// surviving assistant turn, else the run would stay open and swallow the next
+	// human message as a steer.
 	if !merge && len(turn.Blocks) == 0 {
+		terminal := turn.Terminal
 		tr.Turns = tr.Turns[:turnIdx]
+		if terminal != "" {
+			for i := len(tr.Turns) - 1; i >= 0; i-- {
+				if tr.Turns[i].Role == "assistant" {
+					tr.Turns[i].Terminal = terminal
+					break
+				}
+			}
+		}
 		return
 	}
 	*lastAsstIdx = turnIdx

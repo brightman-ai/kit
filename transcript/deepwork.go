@@ -313,8 +313,10 @@ func (s *DeepworkSource) appendUserTurn(tr *Transcript, line *NativeEntry) {
 	if text == "" {
 		return
 	}
+	// deepwork native: every user entry is an independent intent (its assistant entry
+	// closes the exchange). Stated here so the projector never infers boundaries.
 	tr.Turns = append(tr.Turns, Turn{
-		Index: len(tr.Turns), Role: "user", At: tsPtr(at),
+		Index: len(tr.Turns), Role: "user", At: tsPtr(at), InputKind: InputIntent,
 		Blocks: []Block{{Type: BlockUser, Text: text}},
 	})
 }
@@ -356,6 +358,7 @@ func (s *DeepworkSource) appendAssistantTurn(tr *Transcript, line *NativeEntry, 
 			if bi, hit := pending[c.ToolUseID]; hit {
 				turn.Blocks[bi].ToolResult = nativeContentResultText(c)
 				turn.Blocks[bi].IsError = c.IsError
+				turn.Blocks[bi].ResultSeen = true
 			} else {
 				// orphan result (no preceding tool_use in this turn) → keep it
 				// visible as a standalone tool block rather than dropping content.
@@ -365,8 +368,18 @@ func (s *DeepworkSource) appendAssistantTurn(tr *Transcript, line *NativeEntry, 
 					ToolName:   c.Name,
 					ToolResult: nativeContentResultText(c),
 					IsError:    c.IsError,
+					ResultSeen: true,
+					Orphan:     true,
 				})
 			}
+		}
+	}
+
+	// A deepwork native assistant entry IS the closed exchange → its text is the answer
+	// (same domain fact claude gets from end_turn and codex from task_complete).
+	for bi := range turn.Blocks {
+		if turn.Blocks[bi].Type == BlockText {
+			turn.Blocks[bi].Final = true
 		}
 	}
 
@@ -393,6 +406,11 @@ func (s *DeepworkSource) appendAssistantTurn(tr *Transcript, line *NativeEntry, 
 	if len(turn.Blocks) == 0 {
 		return
 	}
+	// deepwork's native transcript writes ONE assistant entry per closed exchange —
+	// the entry itself IS the yield to the human. Stamp the run-boundary fact so the
+	// AgentRun projector treats deepwork exactly like claude/codex (zero provider
+	// branches in the projector).
+	turn.Terminal = TerminalEndTurn
 	tr.Turns = append(tr.Turns, turn)
 }
 
@@ -448,14 +466,14 @@ func (s *DeepworkSource) loadFromDB(ctx context.Context, ref SessionRef) (*Trans
 		at := t.At
 		if u := strings.TrimSpace(t.UserInput); u != "" {
 			tr.Turns = append(tr.Turns, Turn{
-				Index: len(tr.Turns), Role: "user", At: tsPtr(at),
+				Index: len(tr.Turns), Role: "user", At: tsPtr(at), InputKind: InputIntent,
 				Blocks: []Block{{Type: BlockUser, Text: u}},
 			})
 		}
 		if a := strings.TrimSpace(t.AIOutput); a != "" {
 			tr.Turns = append(tr.Turns, Turn{
 				Index: len(tr.Turns), Role: "assistant", At: tsPtr(at),
-				Blocks: []Block{{Type: BlockText, Text: a}},
+				Blocks: []Block{{Type: BlockText, Text: a, Final: true}}, Terminal: TerminalEndTurn,
 			})
 		}
 	}
