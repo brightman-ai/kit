@@ -1,24 +1,41 @@
-// Package usage — codex_quota.go: real codex subscription quota from the rollout
-// transcript. Codex writes its account rate-limit state into
-// ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl as `token_count` events carrying a
-// `rate_limits` object (primary=5h, secondary=7d). We read the newest rollout's
-// LAST such object — that is the most recent account-level snapshot.
+// Package usage — codex_quota.go: the codex ACCOUNT rate limit, read from the rollout
+// transcripts codex writes to ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl.
 //
-// Same source abtop reads (no API, no auth; read-only). The data is persisted on
-// disk so the quota endpoint can answer WITHOUT a live run.
+// Two things make this harder than "read the last rate_limits object", and getting either
+// wrong produces numbers that look plausible and are simply false:
+//
+//  1. A rollout carries SEVERAL limit families. Alongside the account limit
+//     (limit_id "codex", no limit_name) codex emits per-model sub-limits — e.g.
+//     {"limit_id":"codex_bengalfox","limit_name":"GPT-5.3-Codex-Spark"} — which have their
+//     OWN 5h/7d windows and their own, much lower, usage. The sub-limit heartbeats more
+//     often, so the LAST rate_limits in a file is usually a sub-limit. Reading it reported
+//     "92% left" while `codex /status` said 26% — the account was nearly out of quota and
+//     the UI said it was fine. We therefore select the UNNAMED (account) family and ignore
+//     named per-model limits.
+//
+//  2. The newest file's newest ACCOUNT entry is not its last line, and may not even be in
+//     the newest file. We take the entry with the greatest EVENT timestamp across the few
+//     most recent rollouts, and use that timestamp as the reading's capture time — so
+//     "更新于 …" tells the truth instead of tracking a file's mtime.
+//
+// Read-only, no API call, no auth: the same data `codex /status` shows is already on disk.
 package usage
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/json"
 	"os"
-	"path/filepath"
-	"strings"
 	"time"
+
+	"github.com/brightman-ai/kit/transcript"
 )
 
-// codexRateWindow mirrors one slot of codex's rate_limits (primary/secondary).
+// codexScanFiles bounds how many recent rollouts we look at. Rollouts reach tens of MB and
+// rate-limit events land at the end, so scanning the tail (transcript.ScanTail) of the few
+// newest files finds the current reading while reading far less than the whole tree.
+const codexScanFiles = 4
+
+// codexRateWindow mirrors one slot of codex's rate_limits (primary=5h / secondary=7d).
 type codexRateWindow struct {
 	UsedPercent   float64 `json:"used_percent"`
 	WindowMinutes int     `json:"window_minutes"`
@@ -27,81 +44,82 @@ type codexRateWindow struct {
 
 // codexRateLimits is the rate_limits object embedded in a token_count event.
 type codexRateLimits struct {
+	// LimitID is "codex" for the account limit; per-model sub-limits carry their own id.
+	LimitID string `json:"limit_id"`
+	// LimitName is set ONLY on per-model sub-limits ("GPT-5.3-Codex-Spark"). The account
+	// limit leaves it null — that absence is how we tell the two apart.
+	LimitName string           `json:"limit_name"`
 	Primary   *codexRateWindow `json:"primary"`
 	Secondary *codexRateWindow `json:"secondary"`
 	PlanType  string           `json:"plan_type"`
 }
 
-// codexSessionsDir returns ~/.codex/sessions (overridable for tests via the arg).
-func codexSessionsDir() string {
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".codex", "sessions")
+// isAccountLimit reports whether this object describes the ACCOUNT's quota (the number
+// `codex /status` prints as "5h limit / Weekly limit") rather than one model's sub-limit.
+// A named family is per-model; an unnamed family with no windows at all (the "premium"
+// credits stub) tells us nothing and is equally useless.
+func (rl codexRateLimits) isAccountLimit() bool {
+	return rl.LimitName == "" && (rl.Primary != nil || rl.Secondary != nil)
 }
 
-// latestCodexRateLimits walks the rollout tree, opens the newest rollout-*.jsonl,
-// and returns the LAST account-level rate_limits object in it. ok=false when no
-// rollout / no rate_limits exists.
-func latestCodexRateLimits(root string) (codexRateLimits, bool) {
-	var newest string
-	var newestMod time.Time
-	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
-			return nil
+// codexRolloutLine is the shape we need off one transcript line: when it happened, and the
+// rate_limits it carries (codex nests events as {timestamp, type, payload}).
+type codexRolloutLine struct {
+	Timestamp  string           `json:"timestamp"`
+	RateLimits *codexRateLimits `json:"rate_limits"`
+	Payload    *struct {
+		RateLimits *codexRateLimits `json:"rate_limits"`
+	} `json:"payload"`
+}
+
+// latestCodexRateLimits returns the most recent ACCOUNT rate-limit reading across the few
+// newest rollouts, along with when it was captured. ok=false when no such reading exists.
+func latestCodexRateLimits(root string) (rl codexRateLimits, capturedAt time.Time, ok bool) {
+	for _, path := range transcript.NewestFiles(root, transcript.RolloutPrefix, transcript.JSONLSuffix, codexScanFiles) {
+		candidate, at, found := scanCodexRateLimits(path)
+		if !found {
+			continue
 		}
-		name := d.Name()
-		if !strings.HasPrefix(name, "rollout-") || !strings.HasSuffix(name, ".jsonl") {
-			return nil
+		if !ok || at.After(capturedAt) {
+			rl, capturedAt, ok = candidate, at, true
 		}
-		if info, e := d.Info(); e == nil && info.ModTime().After(newestMod) {
-			newestMod = info.ModTime()
-			newest = path
+	}
+	return rl, capturedAt, ok
+}
+
+// scanCodexRateLimits reads the tail of one rollout and returns its newest ACCOUNT reading
+// (by event timestamp) plus that timestamp. Per-model sub-limits are skipped — see the file
+// header for why reading them silently reports the wrong quota.
+func scanCodexRateLimits(path string) (rl codexRateLimits, capturedAt time.Time, ok bool) {
+	needle := []byte("rate_limits")
+	_ = transcript.ScanTail(path, transcript.DefaultTailBytes, func(line []byte) bool {
+		if !bytes.Contains(line, needle) {
+			return true
 		}
-		return nil
+		var row codexRolloutLine
+		if json.Unmarshal(line, &row) != nil {
+			return true
+		}
+		candidate := row.RateLimits
+		if candidate == nil && row.Payload != nil {
+			candidate = row.Payload.RateLimits
+		}
+		if candidate == nil || !candidate.isAccountLimit() {
+			return true // a per-model sub-limit — reading it would report the wrong quota
+		}
+		at, _ := time.Parse(time.RFC3339, row.Timestamp)
+		if !ok || at.After(capturedAt) {
+			rl, capturedAt, ok = *candidate, at, true
+		}
+		return true
 	})
-	if newest == "" {
-		return codexRateLimits{}, false
-	}
-	return scanCodexRateLimits(newest)
-}
-
-// scanCodexRateLimits reads one rollout file and returns its LAST rate_limits.
-// rate_limits sits either at the line top level or under `payload` (codex wraps
-// events as {type, payload}); we check both, keeping the most recent non-empty.
-func scanCodexRateLimits(path string) (codexRateLimits, bool) {
-	f, err := os.Open(path) //nolint:gosec — read-only quota probe
-	if err != nil {
-		return codexRateLimits{}, false
-	}
-	defer f.Close()
-
-	var last codexRateLimits
-	found := false
-	br := bufio.NewReaderSize(f, 256*1024)
-	for {
-		line, readErr := br.ReadBytes('\n')
-		if len(line) > 0 && bytes.Contains(line, []byte("rate_limits")) {
-			var row struct {
-				RateLimits *codexRateLimits `json:"rate_limits"`
-				Payload    *struct {
-					RateLimits *codexRateLimits `json:"rate_limits"`
-				} `json:"payload"`
-			}
-			if json.Unmarshal(bytes.TrimRight(line, "\r\n"), &row) == nil {
-				rl := row.RateLimits
-				if rl == nil && row.Payload != nil {
-					rl = row.Payload.RateLimits
-				}
-				if rl != nil && (rl.Primary != nil || rl.Secondary != nil) {
-					last = *rl
-					found = true
-				}
-			}
-		}
-		if readErr != nil {
-			break
+	if ok && capturedAt.IsZero() {
+		// A reading with no parseable timestamp still beats none; fall back to the file's mtime.
+		if fi, err := os.Stat(path); err == nil {
+			capturedAt = fi.ModTime()
 		}
 	}
-	return last, found
+	return rl, capturedAt, ok
 }
 
 // codexQuotaWindow maps a codex slot onto the unified QuotaWindow (5h/7d).

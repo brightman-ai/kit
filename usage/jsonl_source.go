@@ -40,12 +40,14 @@ func NewJSONLTokenSourceAt(dir string) *JSONLTokenSource {
 	return &JSONLTokenSource{claudeProjectsDir: dir}
 }
 
+// projectsDir resolves the scan root through kit/transcript's single root resolver, so a
+// CLAUDE_CONFIG_DIR user cannot end up with quota read from one ~/.claude and spend read
+// from another.
 func (s *JSONLTokenSource) projectsDir() string {
 	if s.claudeProjectsDir != "" {
 		return s.claudeProjectsDir
 	}
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".claude", "projects")
+	return claudeProjectsDir()
 }
 
 // dedupKey identifies a unique assistant message across all JSONL files.
