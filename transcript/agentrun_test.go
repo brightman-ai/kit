@@ -1,10 +1,10 @@
 package transcript
 
 import (
-	"strings"
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -430,6 +430,15 @@ func TestProjectAgentRuns_RealClaudeTranscript(t *testing.T) {
 	if len(runs) == 0 {
 		t.Fatal("no runs projected from a real transcript")
 	}
+	humanIntentRuns := 0
+	for _, run := range runs {
+		if run.UserIntent != nil {
+			humanIntentRuns++
+		}
+	}
+	if big.TurnCount != humanIntentRuns {
+		t.Errorf("real list/human-intent drift: list=%d human-intent AgentRuns=%d (all runs=%d)", big.TurnCount, humanIntentRuns, len(runs))
+	}
 	rawAsst := 0
 	for _, tn := range tr.Turns {
 		if tn.Role == "assistant" {
@@ -449,6 +458,36 @@ func TestProjectAgentRuns_RealClaudeTranscript(t *testing.T) {
 		}
 	}
 	t.Logf("real claude: %d runs from %d assistant turns (%d raw turns)", len(runs), rawAsst, len(tr.Turns))
+}
+
+func TestClaudeListTurnCountMatchesAgentRunsWithSteer(t *testing.T) {
+	root := t.TempDir()
+	projectDir := "/tmp/list-round-count"
+	lines := []string{
+		`{"type":"user","timestamp":"2026-07-12T10:00:00Z","message":{"role":"user","content":"first intent"}}`,
+		`{"type":"assistant","timestamp":"2026-07-12T10:00:01Z","message":{"id":"m1","role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}}]}}`,
+		`{"type":"user","timestamp":"2026-07-12T10:00:02Z","message":{"role":"user","content":"steer inside the same run"}}`,
+		`{"type":"assistant","timestamp":"2026-07-12T10:00:03Z","message":{"id":"m2","role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"done"}]}}`,
+		`{"type":"user","timestamp":"2026-07-12T10:00:04Z","message":{"role":"user","content":"second intent"}}`,
+		`{"type":"assistant","timestamp":"2026-07-12T10:00:05Z","message":{"id":"m3","role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"done again"}]}}`,
+	}
+	writeLines(t, filepath.Join(root, EncodeProjectDir(projectDir), "session-steer.jsonl"), lines)
+	src := &ClaudeSource{Root: root}
+	metas, err := src.ListSessions(context.Background(), projectDir)
+	if err != nil || len(metas) != 1 {
+		t.Fatalf("ListSessions: err=%v metas=%+v", err, metas)
+	}
+	tr, err := src.LoadTranscript(context.Background(), SessionRef{ProjectDir: projectDir, ID: "session-steer"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runs := ProjectAgentRuns(tr)
+	if metas[0].TurnCount != 2 || metas[0].TurnCount != len(runs) {
+		t.Fatalf("list=%d runs=%d, want one count per independent intent", metas[0].TurnCount, len(runs))
+	}
+	if len(runs[0].Amendments) != 1 {
+		t.Fatalf("steer must stay inside run 1: %+v", runs[0])
+	}
 }
 
 func intentText(r AgentRun) string {

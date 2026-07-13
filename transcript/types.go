@@ -53,12 +53,46 @@ type SessionMeta struct {
 	Activity  string `json:"activity,omitempty"`
 	Attention string `json:"attention,omitempty"`
 	Owned     bool   `json:"owned,omitempty"`
+	// SessionExecution is orthogonal to the root liveness/write-authority axes above.
+	// A quiet root may still have running child AgentExecutions.
+	ExecutionActivity   string `json:"execution_activity,omitempty"` // running | idle
+	RootAgentState      string `json:"root_agent_state,omitempty"`   // running | waiting | idle | error
+	InteractionMode     string `json:"interaction_mode,omitempty"`   // owned | observed | history
+	RunningAgents       int    `json:"running_agents,omitempty"`
+	ExecutionObservedAt int64  `json:"execution_observed_at,omitempty"`
+	AgentSourceStatus   string `json:"agent_source_status,omitempty"` // complete | partial | unknown
 }
 
 // SessionRef addresses one session inside a source for transcript loading.
 type SessionRef struct {
 	ProjectDir string // the project root_dir the session belongs to
 	ID         string // source-scoped id (claude jsonl basename / deepwork session id)
+}
+
+// WindowRequest addresses a bounded suffix/range of an append-only transcript.
+// Before is an opaque source cursor (currently a byte boundary), not a run index.
+type WindowRequest struct {
+	Before     *int64
+	Limit      int
+	Generation string
+}
+
+// WindowResult carries a projected AgentRun window. Generation remains stable across
+// appends and changes on replacement; Reset tells clients to discard an invalid cursor.
+type WindowResult struct {
+	Transcript  *Transcript
+	Before      int64
+	HasMore     bool
+	Version     string
+	Generation  string
+	Reset       bool
+	BytesParsed int64
+}
+
+// WindowSource is the performance boundary for large append-only transcripts.
+// Implementations find and parse only the requested tail/range.
+type WindowSource interface {
+	LoadTranscriptWindow(ctx context.Context, ref SessionRef, req WindowRequest) (*WindowResult, error)
 }
 
 // Transcript is the parsed body of one session.

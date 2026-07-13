@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -57,7 +58,7 @@ func (s *ClaudeSource) projectDirPath(projectDir string) string {
 func (s *ClaudeSource) TranscriptPathFor(projectDir, id string) string {
 	projectDir = strings.TrimSpace(projectDir)
 	id = strings.TrimSpace(id)
-	if projectDir == "" || id == "" {
+	if projectDir == "" || id == "" || filepath.Base(id) != id || strings.Contains(id, "..") {
 		return ""
 	}
 	return filepath.Join(s.projectDirPath(projectDir), id+".jsonl")
@@ -111,7 +112,8 @@ func (s *ClaudeSource) CountSessionsForDir(projectDir string) int {
 
 // scanMeta does a single streaming pass over a jsonl to extract list metadata:
 // title (ai-title event preferred, else first real user message), created (first
-// timestamp), updated (last timestamp), turn_count (number of user turns).
+// timestamp), updated (last timestamp), turn_count (number of independent human
+// intents — mid-run steers are amendments, matching AgentRun/RoundNav semantics).
 func (s *ClaudeSource) scanMeta(path, id string) SessionMeta {
 	meta := SessionMeta{ID: id, Source: KindClaude, SsotPath: path}
 
@@ -131,6 +133,7 @@ func (s *ClaudeSource) scanMeta(path, id string) SessionMeta {
 	var aiTitle, firstUser string
 	var firstTS, lastTS time.Time
 	userTurns := 0
+	runOpen := false
 
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 1<<20), 32<<20) // tolerate very long lines (18MB files)
@@ -162,12 +165,26 @@ func (s *ClaudeSource) scanMeta(path, id string) SessionMeta {
 			// transcript view shows (an independent human intent). A task-notification and
 			// an ESC interrupt marker are runtime bookkeeping written on user-role lines —
 			// counting them made the list claim rounds the human never sent.
-			if isInterruptMarker(txt) || parseTaskNotification(txt) != nil {
+			if isInterruptMarker(txt) {
+				runOpen = false
 				continue
 			}
-			userTurns++
+			if parseTaskNotification(txt) != nil {
+				continue
+			}
+			// Same adapter fact as LoadTranscript: a human line while the model is
+			// inside its tool loop is a steer/amendment, not another round. Parsing
+			// stop_reason here adds no second domain rule and keeps list/RoundNav exact.
+			if !runOpen {
+				userTurns++
+				runOpen = true
+			}
 			if firstUser == "" {
 				firstUser = txt
+			}
+		case "assistant":
+			if m := line.msg(); m != nil && (m.StopReason == "end_turn" || m.StopReason == "stop_sequence") {
+				runOpen = false
 			}
 		}
 	}
@@ -191,14 +208,29 @@ func (s *ClaudeSource) scanMeta(path, id string) SessionMeta {
 
 // LoadTranscript fully parses one jsonl into ordered turns/blocks.
 func (s *ClaudeSource) LoadTranscript(ctx context.Context, ref SessionRef) (*Transcript, error) {
-	path := filepath.Join(s.projectDirPath(ref.ProjectDir), ref.ID+".jsonl")
+	path := s.TranscriptPathFor(ref.ProjectDir, ref.ID)
+	if path == "" {
+		return nil, os.ErrNotExist
+	}
+	return s.LoadTranscriptFile(ctx, path, ref.ID)
+}
+
+// LoadTranscriptFile parses a Claude transcript already resolved by a trusted caller.
+// It exists for child AgentExecution streams, which live under
+// <root-session>/subagents/agent-<id>.jsonl rather than the project shard's top level.
+// HTTP handlers must capability-check the agent against its root tree before calling
+// this method; accepting arbitrary user paths is intentionally not this layer's job.
+func (s *ClaudeSource) LoadTranscriptFile(ctx context.Context, path, refID string) (*Transcript, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
+	return s.loadTranscriptReader(ctx, f, refID)
+}
 
-	tr := &Transcript{Source: KindClaude, Ref: ref.ID, Meta: map[string]interface{}{}}
+func (s *ClaudeSource) loadTranscriptReader(ctx context.Context, reader io.Reader, refID string) (*Transcript, error) {
+	tr := &Transcript{Source: KindClaude, Ref: refID, Meta: map[string]interface{}{}}
 	// tool_use id → (turnIdx, blockIdx) so a later tool_result can attach.
 	pending := map[string]toolLoc{}
 	var aiTitle string
@@ -217,9 +249,12 @@ func (s *ClaudeSource) LoadTranscript(ctx context.Context, ref SessionRef) (*Tra
 	// this — the adapter states it on Turn.InputKind.
 	runOpen := false
 
-	sc := bufio.NewScanner(f)
+	sc := bufio.NewScanner(reader)
 	sc.Buffer(make([]byte, 0, 1<<20), 32<<20)
 	for sc.Scan() {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		var line rawLine
 		if err := json.Unmarshal(sc.Bytes(), &line); err != nil {
 			continue
@@ -256,11 +291,76 @@ func (s *ClaudeSource) LoadTranscript(ctx context.Context, ref SessionRef) (*Tra
 		}
 	}
 
-	tr.Title = firstNonEmpty(aiTitle, transcriptFirstUser(tr), "claude session "+shortID(ref.ID))
+	tr.Title = firstNonEmpty(aiTitle, transcriptFirstUser(tr), "claude session "+shortID(refID))
 	tr.Meta["input_tokens"] = totalIn
 	tr.Meta["output_tokens"] = totalOut
 	tr.Meta["cache_read_tokens"] = totalCacheRead
 	return tr, nil
+}
+
+// LoadTranscriptWindow finds runtime yield boundaries from the tail and parses only
+// that byte range. Large immutable prefixes never enter the JSON/block parser.
+func (s *ClaudeSource) LoadTranscriptWindow(ctx context.Context, ref SessionRef, req WindowRequest) (*WindowResult, error) {
+	path := s.TranscriptPathFor(ref.ProjectDir, ref.ID)
+	if path == "" {
+		return nil, os.ErrNotExist
+	}
+	return s.LoadTranscriptFileWindow(ctx, path, ref.ID, req)
+}
+
+// LoadTranscriptFileWindow is the trusted-path variant used by child executions.
+func (s *ClaudeSource) LoadTranscriptFileWindow(ctx context.Context, path, refID string, req WindowRequest) (*WindowResult, error) {
+	rng, err := resolveSourceWindow(ctx, path, req, claudeYieldBoundary)
+	if err != nil {
+		return nil, err
+	}
+	closer, reader, err := sectionReader(path, rng.start, rng.end)
+	if err != nil {
+		return nil, err
+	}
+	defer closer.Close()
+	tr, err := s.loadTranscriptReader(ctx, reader, refID)
+	if err != nil {
+		return nil, err
+	}
+	tr.Runs = ProjectAgentRuns(tr)
+	tr.Turns = nil
+	return &WindowResult{
+		Transcript: tr, Before: rng.start, HasMore: rng.hasMore,
+		Version: rng.version, Generation: rng.generation, Reset: rng.reset,
+		BytesParsed: rng.end - rng.start,
+	}, nil
+}
+
+func claudeYieldBoundary(raw []byte) (bool, string) {
+	if len(raw) == 0 {
+		return false, ""
+	}
+	var line rawLine
+	if json.Unmarshal(raw, &line) != nil {
+		return false, ""
+	}
+	if line.Type == "assistant" {
+		if m := line.msg(); m != nil && (m.StopReason == "end_turn" || m.StopReason == "stop_sequence") {
+			return true, "assistant:" + m.ID
+		}
+	}
+	if line.Type == "user" && !line.IsMeta {
+		text := line.contentString()
+		if text == "" {
+			var b strings.Builder
+			for _, part := range line.contentParts() {
+				if part.Type == "text" {
+					b.WriteString(part.Text)
+				}
+			}
+			text = b.String()
+		}
+		if isInterruptMarker(text) {
+			return true, "interrupt:" + line.Timestamp
+		}
+	}
+	return false, ""
 }
 
 // appendUserTurn turns a user line into either a tool_result attachment (when

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -50,6 +51,35 @@ func NewCodexSource() *CodexSource {
 }
 
 func (s *CodexSource) Kind() string { return KindCodex }
+
+// TranscriptPathFor resolves a source-scoped Codex thread id to its rollout file.
+// It exposes the same resolver LoadTranscript uses so HTTP version/ETag checks do not
+// duplicate the rollout filename convention or parse the transcript body.
+func (s *CodexSource) TranscriptPathFor(id string) string {
+	path, _ := s.resolvePath(strings.TrimSpace(id))
+	return path
+}
+
+// TranscriptBelongsToProject validates a runtime session capability against the
+// cwd recorded by Codex in session_meta. A source-scoped id alone is insufficient:
+// HTTP routes are workspace-scoped and must not read a valid thread from another cwd.
+func (s *CodexSource) TranscriptBelongsToProject(id, projectDir string) bool {
+	path := s.TranscriptPathFor(id)
+	want := strings.TrimSpace(projectDir)
+	if path == "" || want == "" {
+		return false
+	}
+	return filepath.Clean(s.firstLineCwd(path)) == filepath.Clean(want)
+}
+
+// TranscriptProjectDir returns the cwd capability recorded by Codex for a thread.
+func (s *CodexSource) TranscriptProjectDir(id string) string {
+	path := s.TranscriptPathFor(id)
+	if path == "" {
+		return ""
+	}
+	return s.firstLineCwd(path)
+}
 
 // sessionsDir is the rollout root: <Root>/sessions.
 func (s *CodexSource) sessionsDir() string {
@@ -322,14 +352,27 @@ func (s *CodexSource) LoadTranscript(ctx context.Context, ref SessionRef) (*Tran
 	if path == "" {
 		return &Transcript{Source: KindCodex, Ref: ref.ID}, nil
 	}
+	if strings.TrimSpace(ref.ProjectDir) != "" && filepath.Clean(s.firstLineCwd(path)) != filepath.Clean(ref.ProjectDir) {
+		return nil, os.ErrNotExist
+	}
+	return s.LoadTranscriptFile(ctx, path, ref.ID)
+}
 
+// LoadTranscriptFile parses a Codex rollout already resolved by a trusted caller.
+// Child AgentExecutions carry their own rollout path in the runtime-neutral tree; the
+// web layer first proves that node belongs to the requested root session, then calls
+// this parser. The parser remains read-only and does not infer parentage from paths.
+func (s *CodexSource) LoadTranscriptFile(ctx context.Context, path, refID string) (*Transcript, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
+	return s.loadTranscriptReader(ctx, f, refID)
+}
 
-	tr := &Transcript{Source: KindCodex, Ref: ref.ID, Meta: map[string]interface{}{}}
+func (s *CodexSource) loadTranscriptReader(ctx context.Context, reader io.Reader, refID string) (*Transcript, error) {
+	tr := &Transcript{Source: KindCodex, Ref: refID, Meta: map[string]interface{}{}}
 	// call_id → (turnIdx, blockIdx) so a later *_output line attaches its result.
 	pending := map[string]toolLoc{}
 	var cwd, firstUser string
@@ -354,9 +397,12 @@ func (s *CodexSource) LoadTranscript(ctx context.Context, ref SessionRef) (*Tran
 	curModel := ""
 	lineSeq := 0
 
-	sc := bufio.NewScanner(f)
+	sc := bufio.NewScanner(reader)
 	sc.Buffer(make([]byte, 0, 1<<20), 64<<20)
 	for sc.Scan() {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		var line codexLine
 		if json.Unmarshal(sc.Bytes(), &line) != nil {
 			continue
@@ -535,9 +581,59 @@ func (s *CodexSource) LoadTranscript(ctx context.Context, ref SessionRef) (*Tran
 	tr.Title = firstNonEmpty(
 		truncate(firstUser, 80),
 		codexTitleFromCwd(cwd),
-		"codex session "+shortID(ref.ID),
+		"codex session "+shortID(refID),
 	)
 	return tr, nil
+}
+
+func (s *CodexSource) LoadTranscriptWindow(ctx context.Context, ref SessionRef, req WindowRequest) (*WindowResult, error) {
+	path, err := s.resolvePath(ref.ID)
+	if err != nil {
+		return nil, err
+	}
+	if path == "" || (strings.TrimSpace(ref.ProjectDir) != "" && filepath.Clean(s.firstLineCwd(path)) != filepath.Clean(ref.ProjectDir)) {
+		return nil, os.ErrNotExist
+	}
+	return s.LoadTranscriptFileWindow(ctx, path, ref.ID, req)
+}
+
+// LoadTranscriptFileWindow is the trusted-path variant used by child executions.
+func (s *CodexSource) LoadTranscriptFileWindow(ctx context.Context, path, refID string, req WindowRequest) (*WindowResult, error) {
+	rng, err := resolveSourceWindow(ctx, path, req, codexYieldBoundary)
+	if err != nil {
+		return nil, err
+	}
+	closer, reader, err := sectionReader(path, rng.start, rng.end)
+	if err != nil {
+		return nil, err
+	}
+	defer closer.Close()
+	tr, err := s.loadTranscriptReader(ctx, reader, refID)
+	if err != nil {
+		return nil, err
+	}
+	tr.Runs = ProjectAgentRuns(tr)
+	tr.Turns = nil
+	return &WindowResult{
+		Transcript: tr, Before: rng.start, HasMore: rng.hasMore,
+		Version: rng.version, Generation: rng.generation, Reset: rng.reset,
+		BytesParsed: rng.end - rng.start,
+	}, nil
+}
+
+func codexYieldBoundary(raw []byte) (bool, string) {
+	if len(raw) == 0 {
+		return false, ""
+	}
+	var line codexLine
+	if json.Unmarshal(raw, &line) != nil || line.Type != "event_msg" {
+		return false, ""
+	}
+	typ := line.payloadType()
+	if typ != "task_complete" && typ != "turn_aborted" {
+		return false, ""
+	}
+	return true, ""
 }
 
 // stampCodexTerminal records codex's run-lifecycle fact on the last assistant turn,

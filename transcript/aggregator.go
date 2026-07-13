@@ -147,3 +147,27 @@ func (a *Aggregator) LoadTranscript(ctx context.Context, source string, ref Sess
 	}
 	return src.LoadTranscript(ctx, ref)
 }
+
+// LoadTranscriptWindow dispatches the bounded-tail contract to capable sources.
+// Small/native sources retain a correctness-first full-load fallback.
+func (a *Aggregator) LoadTranscriptWindow(ctx context.Context, source string, ref SessionRef, req WindowRequest) (*WindowResult, error) {
+	src := a.SourceByKind(source)
+	if src == nil {
+		return nil, ErrUnknownSource
+	}
+	if windowed, ok := src.(WindowSource); ok {
+		return windowed.LoadTranscriptWindow(ctx, ref, req)
+	}
+	tr, err := src.LoadTranscript(ctx, ref)
+	if err != nil {
+		return nil, err
+	}
+	runs := ProjectAgentRuns(tr)
+	limit := normalizeWindowLimit(req.Limit)
+	start := len(runs) - limit
+	if start < 0 {
+		start = 0
+	}
+	tr.Runs = runs[start:]
+	return &WindowResult{Transcript: tr, Before: int64(start), HasMore: start > 0}, nil
+}
