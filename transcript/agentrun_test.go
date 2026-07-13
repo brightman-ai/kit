@@ -1,6 +1,7 @@
 package transcript
 
 import (
+	"strings"
 	"context"
 	"os"
 	"path/filepath"
@@ -249,7 +250,7 @@ func TestProjectAgentRuns_UnterminatedIsHonest(t *testing.T) {
 	if len(tr.Runs) != 1 {
 		t.Fatalf("want 1 run, got %d", len(tr.Runs))
 	}
-	if tr.Runs[0].Status != RunUnterminated || !tr.Runs[0].Diagnostic.Unterminated {
+	if tr.Runs[0].Status != RunOpen || !tr.Runs[0].Diagnostic.Unterminated {
 		t.Errorf("status = %q (diag=%+v), want unterminated", tr.Runs[0].Status, tr.Runs[0].Diagnostic)
 	}
 }
@@ -320,7 +321,7 @@ func TestProjectAgentRuns_MissingTerminalDoesNotSwallowNextIntent(t *testing.T) 
 	if len(tr.Runs) != 2 {
 		t.Fatalf("want 2 runs (the un-terminated one + the new intent), got %d", len(tr.Runs))
 	}
-	if tr.Runs[0].Status != RunUnterminated {
+	if tr.Runs[0].Status != RunOpen {
 		t.Errorf("run #1 status = %q, want unterminated (no fake completed)", tr.Runs[0].Status)
 	}
 	if len(tr.Runs[0].Amendments) != 0 {
@@ -455,4 +456,46 @@ func intentText(r AgentRun) string {
 		return ""
 	}
 	return r.UserIntent.Text
+}
+
+// codex 的两种 tool 输出形态：function_call_output.output 是**字符串**，
+// custom_tool_call_output.output 是**数组**（[{type:"input_text",text:"…"}]）。
+// 把它建模成 string 会让后者整行 unmarshal 失败 → 被跳过：真 rollout 上一轮 284 个工具里
+// 275 个结果就这么静默消失了（UI 只看得到调用、看不到输出，投影也分不清"跑完了"和"被中断"）。
+func TestCodexToolOutput_BothShapesLand(t *testing.T) {
+	tr := loadCodex(t, []string{
+		`{"timestamp":"2026-07-12T10:00:00.000Z","type":"session_meta","payload":{"type":"session_meta","id":"fixture-0000-0000-0000-000000000001","cwd":"/tmp/p","timestamp":"2026-07-12T10:00:00.000Z"}}`,
+		`{"timestamp":"2026-07-12T10:00:01.000Z","type":"event_msg","payload":{"type":"task_started"}}`,
+		`{"timestamp":"2026-07-12T10:00:02.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"跑两个工具"}]}}`,
+		// string 形态
+		`{"timestamp":"2026-07-12T10:00:03.000Z","type":"response_item","payload":{"type":"function_call","name":"shell","call_id":"c1","arguments":"{}"}}`,
+		`{"timestamp":"2026-07-12T10:00:04.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"plain string result"}}`,
+		// array 形态（真 rollout 里 95% 是这种）
+		`{"timestamp":"2026-07-12T10:00:05.000Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"c2","input":"ls"}}`,
+		`{"timestamp":"2026-07-12T10:00:06.000Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"c2","output":[{"type":"input_text","text":"Script completed"},{"type":"input_text","text":"file-a\nfile-b"}]}}`,
+		`{"timestamp":"2026-07-12T10:00:07.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"好了"}]}}`,
+		`{"timestamp":"2026-07-12T10:00:08.000Z","type":"event_msg","payload":{"type":"task_complete"}}`,
+	})
+	r := tr.Runs[0]
+	tools := []Block{}
+	for _, b := range r.Segments {
+		if b.Type == BlockTool {
+			tools = append(tools, b)
+		}
+	}
+	if len(tools) != 2 {
+		t.Fatalf("want 2 tools, got %d", len(tools))
+	}
+	for _, b := range tools {
+		if b.ToolResult == "" || !b.ResultSeen {
+			t.Errorf("tool %q lost its result: result=%q seen=%v", b.ToolUseID, b.ToolResult, b.ResultSeen)
+		}
+	}
+	if !strings.Contains(tools[1].ToolResult, "file-a") {
+		t.Errorf("array-shaped output not decoded: %q", tools[1].ToolResult)
+	}
+	// 结果都回来了 → 没有"待完成的工具"，这一轮不会被误判成 stalled。
+	if r.Diagnostic.PendingTools != 0 {
+		t.Errorf("pending_tools = %d, want 0 (every result arrived)", r.Diagnostic.PendingTools)
+	}
 }

@@ -66,10 +66,50 @@ type codexFunctionCall struct {
 }
 
 // codexFunctionOutput is a response_item payload of type=function_call_output /
-// custom_tool_call_output. output is the tool's textual result.
+// custom_tool_call_output. Its `output` has TWO shapes in real rollouts:
+//
+//	function_call_output      → a plain string
+//	custom_tool_call_output   → an ARRAY of content parts [{type:"input_text", text:"…"}]
+//
+// Modeling it as `string` made every custom_tool_call_output line fail to unmarshal and
+// be skipped whole — on a real 16 MB rollout that silently dropped 275 of 284 tool
+// results in a single round (the UI showed the calls but never their output, and the
+// projector could not tell a finished tool from an interrupted one). RawMessage + a
+// tolerant decoder is why both shapes now land.
 type codexFunctionOutput struct {
-	CallID string `json:"call_id"`
-	Output string `json:"output"`
+	CallID string          `json:"call_id"`
+	Output json.RawMessage `json:"output"`
+}
+
+// codexOutputPart is one element of the custom_tool_call_output array form.
+type codexOutputPart struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
+// text decodes either output shape into the tool result the UI renders.
+func (o *codexFunctionOutput) text() string {
+	if len(o.Output) == 0 {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(o.Output, &s) == nil {
+		return s
+	}
+	var parts []codexOutputPart
+	if json.Unmarshal(o.Output, &parts) == nil {
+		var b strings.Builder
+		for _, p := range parts {
+			if t := strings.TrimSpace(p.Text); t != "" {
+				if b.Len() > 0 {
+					b.WriteString("\n")
+				}
+				b.WriteString(p.Text)
+			}
+		}
+		return b.String()
+	}
+	return string(o.Output) // unknown shape → keep the raw payload rather than losing it
 }
 
 // codexReasoning is a response_item payload of type=reasoning. summary holds

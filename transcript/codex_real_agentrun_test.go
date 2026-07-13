@@ -34,7 +34,7 @@ func TestProjectAgentRuns_RealCodexRollout(t *testing.T) {
 			completed++
 		case RunInterrupted:
 			interrupted++
-		case RunUnterminated:
+		case RunOpen:
 			unterm++
 		}
 	}

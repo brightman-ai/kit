@@ -452,13 +452,13 @@ func (s *CodexSource) LoadTranscript(ctx context.Context, ref SessionRef) (*Tran
 							Index: len(tr.Turns), Role: "assistant", At: tsPtr(at),
 							Blocks: []Block{{
 								Type: BlockTool, EventID: o.CallID, ToolUseID: o.CallID,
-								ToolResult: o.Output, ResultSeen: true, Orphan: true,
+								ToolResult: o.text(), ResultSeen: true, Orphan: true,
 							}},
 						})
 						continue
 					}
 					blk := &tr.Turns[loc.t].Blocks[loc.b]
-					blk.ToolResult = o.Output
+					blk.ToolResult = o.text()
 					blk.ResultSeen = true // it actually completed (vs. cut off by an abort)
 					delete(pending, o.CallID)
 				}

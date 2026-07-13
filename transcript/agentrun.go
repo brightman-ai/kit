@@ -76,14 +76,24 @@ type RunUsage struct {
 	Models            []string `json:"models,omitempty"`
 }
 
-// AgentRun.Status — how the run ended, honestly. There is no "success" guess: a run
-// whose transcript simply stops (session killed mid-tool-loop) is Unterminated, never
-// Completed.
+// AgentRun.Status — what the TRANSCRIPT says about how the run ended. Nothing more.
+//
+// RunOpen deliberately does NOT mean "abandoned": a transcript with no terminal event is
+// either (a) still being written right now by a live CLI, or (b) a session that died
+// mid-loop — and this package cannot tell those apart. It has no clock, no process table,
+// no file watcher; asserting "未完成/会话中断" on a session that is at this moment working
+// would be a lie. Liveness is a different fact, owned by a different layer
+// (sessionactivity: owned REPL + transcript mtime), and the wire layer joins the two:
+//
+//	open + LIVE/OBSERVED → running     (the CLI is writing to it as we speak)
+//	open + QUIET         → abandoned   (nobody is writing; the run never finished)
+//
+// That split is why the projector stays a pure function of the transcript.
 const (
-	RunCompleted    = "completed"
-	RunInterrupted  = "interrupted"
-	RunError        = "error"
-	RunUnterminated = "unterminated"
+	RunCompleted   = "completed"
+	RunInterrupted = "interrupted"
+	RunError       = "error"
+	RunOpen        = "open"
 )
 
 // RunDiagnostic exposes what the projection had to cope with, so a wrong-looking round
@@ -128,7 +138,7 @@ func ProjectAgentRuns(tr *Transcript) []AgentRun {
 		case TerminalError:
 			cur.Status = RunError
 		default:
-			cur.Status = RunUnterminated
+			cur.Status = RunOpen // no terminal fact in the transcript — liveness decides the rest
 			cur.Diagnostic.Unterminated = true
 		}
 		if at != nil {
@@ -161,7 +171,7 @@ func ProjectAgentRuns(tr *Transcript) []AgentRun {
 			UserIntent: intent,
 			Segments:   make([]Block, 0, 8),
 			StartedAt:  at,
-			Status:     RunUnterminated,
+			Status:     RunOpen,
 			Diagnostic: RunDiagnostic{NoIntent: noIntent},
 		}
 	}
@@ -225,7 +235,7 @@ func ProjectAgentRuns(tr *Transcript) []AgentRun {
 			closeRun(t.Terminal, t.At)
 		}
 	}
-	closeRun("", nil) // transcript ends mid-run → Unterminated (never a fake "completed")
+	closeRun("", nil) // transcript ends mid-run → Open (never a fake "completed", never a false "dead")
 
 	return runs
 }
