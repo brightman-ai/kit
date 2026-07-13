@@ -73,7 +73,7 @@ func (t *Tunnel) Login(ctx context.Context) error {
 		return fmt.Errorf("create login log: %w", err)
 	}
 	cmd := exec.Command(t.binPath, "tunnel", "login") //nolint:gosec — binPath is ours
-	cmd.Env = append(os.Environ(), "TUNNEL_ORIGIN_CERT="+t.certPath)
+	cmd.Env = append(tunnelChildEnv(), "TUNNEL_ORIGIN_CERT="+t.certPath, "NO_PROXY=*", "no_proxy=*")
 	cmd.Stdout = logf
 	cmd.Stderr = logf
 	cmd.SysProcAttr = detachedSysProcAttr()
@@ -184,7 +184,13 @@ func (t *Tunnel) StartNamed(ctx context.Context, hostname, localAddr string) (st
 	// Detached run, forced onto http2. NO_AUTOUPDATE so cloudflared never self-restarts under us.
 	cmd := exec.Command(t.binPath, "tunnel", "run", //nolint:gosec — binPath is ours
 		"--protocol", "http2", "--cred-file", credFile, "--url", localAddr, name)
-	cmd.Env = append(os.Environ(), "TUNNEL_ORIGIN_CERT="+t.resolveCert(), "NO_AUTOUPDATE=true")
+	// cloudflared 的出站只有一个目的地: Cloudflare 边缘 (7844)。它**绝不该走 HTTP 代理** ——
+	// 走了会把边缘连接塞进代理, 代理若不放行 7844 / 本身不可达, 就表现为"隧道一直 Starting 卡死"
+	// (实测: 主机 HTTPS_PROXY 指向一个死代理时, cloudflared 直连边缘明明通, 却因继承该变量去走
+	// 死代理而超时挂掉; 清空 proxy 后 31s 注册成功)。故给子进程剥掉全部 proxy 变量 + NO_PROXY=*。
+	cmd.Env = append(tunnelChildEnv(),
+		"TUNNEL_ORIGIN_CERT="+t.resolveCert(), "NO_AUTOUPDATE=true",
+		"NO_PROXY=*", "no_proxy=*")
 	cmd.Stdout = logf
 	cmd.Stderr = logf
 	cmd.SysProcAttr = detachedSysProcAttr()
@@ -259,7 +265,7 @@ func (t *Tunnel) findTunnel(ctx context.Context, name string) string {
 		cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		var stdout bytes.Buffer
 		cmd := exec.CommandContext(cctx, t.binPath, "tunnel", "list", "--output", "json") //nolint:gosec
-		cmd.Env = append(os.Environ(), "TUNNEL_ORIGIN_CERT="+t.resolveCert())
+		cmd.Env = append(tunnelChildEnv(), "TUNNEL_ORIGIN_CERT="+t.resolveCert(), "NO_PROXY=*", "no_proxy=*")
 		cmd.Stdout = &stdout
 		err := cmd.Run()
 		cancel()
@@ -293,7 +299,7 @@ func (t *Tunnel) runCF(ctx context.Context, args ...string) (string, error) {
 	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(cctx, t.binPath, args...) //nolint:gosec — binPath is ours
-	cmd.Env = append(os.Environ(), "TUNNEL_ORIGIN_CERT="+t.resolveCert())
+	cmd.Env = append(tunnelChildEnv(), "TUNNEL_ORIGIN_CERT="+t.resolveCert(), "NO_PROXY=*", "no_proxy=*")
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }
@@ -492,4 +498,24 @@ func firstCloudflaredError(out string, err error) string {
 		return strings.TrimSpace(lines[len(lines)-1])
 	}
 	return err.Error()
+}
+
+// tunnelChildEnv — 父进程环境去掉全部 HTTP(S)/ALL 代理变量, 供启动 cloudflared 子进程用。
+// cloudflared 只跟 Cloudflare 边缘通信, 走代理没有意义且会挂 (见 StartNamed 处注释)。
+// 大小写两种拼法都清 (Go 只认大写, 但子进程库可能读小写)。
+func tunnelChildEnv() []string {
+	drop := map[string]bool{
+		"HTTP_PROXY": true, "HTTPS_PROXY": true, "ALL_PROXY": true,
+		"http_proxy": true, "https_proxy": true, "all_proxy": true,
+	}
+	src := os.Environ()
+	out := make([]string, 0, len(src))
+	for _, kv := range src {
+		eq := strings.IndexByte(kv, '=')
+		if eq > 0 && drop[kv[:eq]] {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
 }
