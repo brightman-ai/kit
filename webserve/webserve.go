@@ -90,7 +90,11 @@ func SPACSP(frameSrc string) string {
 	}
 	return strings.Join([]string{
 		"default-src 'self'",
-		"script-src 'self'",
+		// 'wasm-unsafe-eval' lets a WebAssembly module INSTANTIATE (e.g. the markdown reader's
+		// graphviz/dot renderer, @hpcc-js/wasm); Chrome blocks WASM compile under a bare 'self'.
+		// It grants WASM instantiation ONLY, not JS eval()/new Function() — a much narrower
+		// relaxation than 'unsafe-eval'. Vite still emits no inline script, so app JS stays 'self'.
+		"script-src 'self' 'wasm-unsafe-eval'",
 		"style-src 'self' 'unsafe-inline'",
 		"img-src 'self' data: blob:",
 		"font-src 'self' data:",
