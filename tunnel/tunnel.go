@@ -86,9 +86,16 @@ type Tunnel struct {
 	totalBytes      atomic.Int64 // -1 means Content-Length unknown
 	downloadURL     atomic.Value // stores string
 
-	binPath   string
-	statePath string // <dataDir>/tunnel.json — persisted url+pid+localAddr
-	logPath   string // <dataDir>/tunnel.log  — detached cloudflared stderr/stdout
+	// Self-healing (supervise.go): the watchdog's log sink + the declared-intent record that tells
+	// it whether a missing cloudflared is a death to heal or a tunnel the user turned off.
+	logMu         sync.RWMutex
+	logf          func(format string, v ...any)
+	superviseOnce sync.Once
+
+	binPath    string
+	statePath  string // <dataDir>/tunnel.json — persisted url+pid+localAddr
+	intentPath string // <dataDir>/tunnel-intent.json — persisted user intent (survives a dead daemon)
+	logPath    string // <dataDir>/tunnel.log  — detached cloudflared stderr/stdout
 
 	// Named-tunnel cloudflared home — per-dataDir so pro/terminal/teamworkbench can keep independent
 	// Cloudflare accounts + tunnel credentials. Preferred over the global ~/.cloudflared, but the
@@ -132,6 +139,7 @@ func New(dataDir string) *Tunnel {
 	t := &Tunnel{
 		binPath:    binPath,
 		statePath:  filepath.Join(dataDir, "tunnel.json"),
+		intentPath: filepath.Join(dataDir, "tunnel-intent.json"),
 		logPath:    filepath.Join(dataDir, "tunnel.log"),
 		cfHome:     cfHome,
 		certPath:   filepath.Join(cfHome, "cert.pem"),
@@ -151,8 +159,11 @@ func New(dataDir string) *Tunnel {
 			t.hostname = st.Hostname
 			t.tunnelName = st.TunnelName
 			t.credFile = st.CredFile
+			// A tunnel started before intent existed is still the user's declared wish — back-fill it
+			// so an already-deployed tunnel comes under the watchdog without the user re-enabling it.
+			t.adoptIntentFromState(st)
 		} else {
-			t.removeState() // stale: the daemon died while no host was running
+			t.removeState() // stale: the daemon died while no host was running — Supervise revives it
 		}
 	}
 	return t
@@ -262,6 +273,9 @@ func (t *Tunnel) Start(ctx context.Context, localAddr string) (string, error) {
 		return "", fmt.Errorf("create tunnel log: %w", err)
 	}
 	cmd := exec.Command(t.binPath, "tunnel", "--url", localAddr) //nolint:gosec — binPath is ours
+	// Same proxy-strip as the named path: cloudflared's only outbound destination is the Cloudflare
+	// edge (7844); an inherited HTTPS_PROXY pointing at a dead/blocking proxy hangs it at "Starting".
+	cmd.Env = append(tunnelChildEnv(), "NO_PROXY=*", "no_proxy=*")
 	cmd.Stdout = logf
 	cmd.Stderr = logf
 	cmd.SysProcAttr = detachedSysProcAttr()
@@ -283,6 +297,7 @@ func (t *Tunnel) Start(ctx context.Context, localAddr string) (string, error) {
 
 	t.setState(true, url, cmd.Process.Pid, localAddr, cmd, "quick", "")
 	t.saveState(persistedState{PublicURL: url, PID: cmd.Process.Pid, LocalAddr: localAddr, LogPath: t.logPath})
+	t.saveIntent(intent{Mode: "quick", LocalAddr: localAddr})
 
 	return url, nil
 }
@@ -318,6 +333,7 @@ func (t *Tunnel) Stop() {
 		cmd.Wait() //nolint:errcheck — reap our own child
 	}
 	t.removeState()
+	t.removeIntent() // the user turned it off: the watchdog must NOT bring it back
 }
 
 // setState atomically updates the live tunnel fields. mode is "quick"/"named" while running,

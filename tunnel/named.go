@@ -213,6 +213,7 @@ func (t *Tunnel) StartNamed(ctx context.Context, hostname, localAddr string) (st
 		PublicURL: url, PID: cmd.Process.Pid, LocalAddr: localAddr, LogPath: t.logPath,
 		Mode: "named", Hostname: hostname, TunnelName: name, CredFile: credFile,
 	})
+	t.saveIntent(intent{Mode: "named", Hostname: hostname, LocalAddr: localAddr})
 	return url, nil
 }
 
@@ -363,6 +364,7 @@ func (t *Tunnel) adoptPersisted(st persistedState) {
 	t.tunnelName = st.TunnelName
 	t.credFile = st.CredFile
 	t.stateMu.Unlock()
+	t.adoptIntentFromState(st) // adopting a live tunnel = the user wants it up → supervise it
 }
 
 // ── log/file helpers ──────────────────────────────────────────────────────────
