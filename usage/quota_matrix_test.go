@@ -3,8 +3,10 @@ package usage
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -109,12 +111,16 @@ func (e *quotaEnv) withCodexRollout(t *testing.T, plan string, resetAt time.Time
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatalf("mkdir %s: %v", dir, err)
 	}
+	// Relative timestamps: a hard-coded date silently ages past maxSnapshotAge and the test
+	// starts failing on the calendar rather than on the code.
+	at := time.Now().Add(-10 * time.Minute).UTC().Format(time.RFC3339)
+	sparkAt := time.Now().Add(-5 * time.Minute).UTC().Format(time.RFC3339)
 	account := fmt.Sprintf(
-		`{"timestamp":"2026-07-12T10:00:00.000Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"codex","limit_name":null,"plan_type":%q,"primary":{"used_percent":78,"window_minutes":300,"resets_at":%d},"secondary":{"used_percent":12,"window_minutes":10080,"resets_at":%d}}}}`,
-		plan, resetAt.Unix(), resetAt.Add(72*time.Hour).Unix())
+		`{"timestamp":%q,"type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"codex","limit_name":null,"plan_type":%q,"primary":{"used_percent":78,"window_minutes":300,"resets_at":%d},"secondary":{"used_percent":12,"window_minutes":10080,"resets_at":%d}}}}`,
+		at, plan, resetAt.Unix(), resetAt.Add(72*time.Hour).Unix())
 	spark := fmt.Sprintf(
-		`{"timestamp":"2026-07-12T10:05:00.000Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"codex_bengalfox","limit_name":"GPT-5.3-Codex-Spark","plan_type":%q,"primary":{"used_percent":8,"window_minutes":300,"resets_at":%d},"secondary":{"used_percent":3,"window_minutes":10080,"resets_at":%d}}}}`,
-		plan, resetAt.Unix(), resetAt.Add(72*time.Hour).Unix())
+		`{"timestamp":%q,"type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"codex_bengalfox","limit_name":"GPT-5.3-Codex-Spark","plan_type":%q,"primary":{"used_percent":8,"window_minutes":300,"resets_at":%d},"secondary":{"used_percent":3,"window_minutes":10080,"resets_at":%d}}}}`,
+		sparkAt, plan, resetAt.Unix(), resetAt.Add(72*time.Hour).Unix())
 	write(t, filepath.Join(dir, "rollout-2026-07-12T00-00-00-abc.jsonl"), account+"\n"+spark+"\n")
 	return e
 }
@@ -464,5 +470,100 @@ func TestProbeAll_ReportsWhatEachRuntimeCanDo(t *testing.T) {
 	}
 	if byRuntime["codex"] != ProbeNotSupported {
 		t.Fatalf("no OAuth token ⟹ nothing to ask with — want not_supported, got %q", byRuntime["codex"])
+	}
+}
+
+// ── 2026-07-13: the probe made things WORSE than not probing ──────────────────
+//
+// The account's active limit family moved from "codex" (5h + 7d) to "premium" (a single
+// 7-day window). The API then reports its UNUSED secondary slot as used=0 / window=0 /
+// reset="" — and taking that at face value invented a phantom window, which resolved to the
+// same kind as the real one and made a bar disappear from the UI.
+
+// A slot with no window LENGTH is not a window: the 5h/7d label is derived from that length,
+// so without it there is nothing to call the thing.
+func TestCodexWindow_SlotWithoutLengthIsNotAWindow(t *testing.T) {
+	if _, ok := codexQuotaWindow(&codexRateWindow{UsedPercent: 0, WindowMinutes: 0}); ok {
+		t.Fatal("used=0 with no window length is an empty slot, not a window at 100% for 7 days")
+	}
+	if _, ok := codexQuotaWindow(&codexRateWindow{UsedPercent: 4, WindowMinutes: 10080}); !ok {
+		t.Fatal("a slot WITH a length is a real window")
+	}
+}
+
+// Two windows of one kind is a contradiction. It must die at the boundary — pushed into the
+// UI, a keyed list renders only one of them and the other silently vanishes.
+func TestQuota_DuplicateWindowKindIsDropped(t *testing.T) {
+	info := QuotaInfo{}
+	info.applyReading(&Reading{
+		CapturedAt: time.Now(),
+		Source:     SourceProbe,
+		Windows: []QuotaWindow{
+			{Kind: "7d", WindowMinutes: 10080, RemainingPercent: 96, ResetAt: time.Now().Add(160 * time.Hour).Format(time.RFC3339)},
+			{Kind: "7d", WindowMinutes: 10080, RemainingPercent: 100}, // the phantom
+		},
+	})
+	if len(info.Windows) != 1 {
+		t.Fatalf("want one 7d window, got %d — a duplicate kind reached the UI", len(info.Windows))
+	}
+	if info.Windows[0].RemainingPercent != 96 {
+		t.Fatalf("the REAL window must survive, got %v%%", info.Windows[0].RemainingPercent)
+	}
+}
+
+// The reading says which limit family it speaks for. Without it, a family switch (5h+7d →
+// one 7-day window) looks exactly like the app losing a bar.
+func TestCodexProbe_RecordsActiveFamilyAndDropsEmptySlot(t *testing.T) {
+	h := http.Header{}
+	h.Set("x-codex-active-limit", "premium")
+	h.Set("x-codex-plan-type", "pro")
+	h.Set("x-codex-primary-used-percent", "4")
+	h.Set("x-codex-primary-window-minutes", "10080")
+	h.Set("x-codex-primary-reset-at", strconv.FormatInt(time.Now().Add(160*time.Hour).Unix(), 10))
+	h.Set("x-codex-secondary-used-percent", "0") // the empty slot the account really sends
+	h.Set("x-codex-secondary-window-minutes", "0")
+	h.Set("x-codex-secondary-reset-at", "")
+
+	snap, ok := codexSnapshotFromHeaders(h)
+	if !ok {
+		t.Fatal("a real primary window is a usable reading")
+	}
+	if snap.Family != "premium" {
+		t.Fatalf("family = %q, want premium (x-codex-active-limit)", snap.Family)
+	}
+	if snap.Secondary != nil {
+		t.Fatal("the empty secondary slot must not become a phantom window")
+	}
+	if snap.Primary == nil || snap.Primary.WindowMinutes != 10080 {
+		t.Fatalf("primary = %+v, want the 7-day window the account actually reports", snap.Primary)
+	}
+}
+
+// An expired window is not unknown. The runtime reports a fresh reading whenever it is used,
+// so a window that rolled with nothing behind it has not been touched since it reset: usage
+// is zero, and the next boundary is the old one rolled forward. The value is INFERRED, and
+// says so.
+func TestQuota_ExpiredWindowInfersFullAndRollsForward(t *testing.T) {
+	env := newQuotaEnv(t).withCredentials(t).withCLI(t, "claude")
+	// A 5h window that reset 90 minutes ago; nothing has reported since.
+	reset := time.Now().Add(-90 * time.Minute)
+	env.withRateLimits(t, "subscription", time.Now().Add(-6*time.Hour), reset, 91)
+
+	q := (claudeProvider{}).Query()
+	w := q.Windows[0]
+
+	if !w.Expired || !w.Inferred {
+		t.Fatalf("a rolled window is expired AND its value inferred, got %+v", w)
+	}
+	if w.RemainingPercent != 100 || w.UsedPercent != 0 {
+		t.Fatalf("nothing reported since the reset ⟹ nothing was used, got %v%% used", w.UsedPercent)
+	}
+	next, err := time.Parse(time.RFC3339, w.ResetAt)
+	if err != nil || !next.After(time.Now()) {
+		t.Fatalf("reset must be rolled forward to a boundary AHEAD of us, got %q", w.ResetAt)
+	}
+	// One whole span forward (RFC3339 keeps seconds, so allow the formatting truncation).
+	if got := next.Sub(reset); got < 5*time.Hour-2*time.Second || got > 5*time.Hour+2*time.Second {
+		t.Fatalf("the 5h window advances by exactly one span, got %v", got)
 	}
 }

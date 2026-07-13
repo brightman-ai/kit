@@ -37,7 +37,14 @@ type Reading struct {
 	Source     string // SourceHook | SourceRollout | SourceProbe
 	Plan       string
 	Billing    string // BillingSubscription | BillingAPI — an api reading has no windows by design
-	Windows    []QuotaWindow
+	// Family is WHICH set of limits this reading describes. Codex accounts have several
+	// ("codex" = 5h+7d, "premium" = a single 7-day window, plus per-model families), and the
+	// provider switches which one is ACTIVE. Two families are not two views of one truth —
+	// they have different windows entirely — so readings from different families must never
+	// be merged window-by-window. The freshest reading wins whole, and it says which family
+	// it speaks for, because "why did my 5h bar disappear?" has no other answer.
+	Family  string
+	Windows []QuotaWindow
 }
 
 // newestReading picks the freshest of several observations, ignoring the ones that do not

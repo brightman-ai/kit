@@ -114,22 +114,28 @@ func codexAccessToken() (string, error) {
 // codexProbeSnapshot is the drop file this probe writes — the codex counterpart of claude's
 // statusline-hook drop file, and read by the same "newest reading wins" rule.
 type codexProbeSnapshot struct {
-	CapturedAt int64            `json:"captured_at"`
-	Source     string           `json:"source"` // "probe" — an account-level reading we asked for
-	PlanType   string           `json:"plan_type,omitempty"`
-	Primary    *codexRateWindow `json:"primary,omitempty"`
-	Secondary  *codexRateWindow `json:"secondary,omitempty"`
+	CapturedAt int64  `json:"captured_at"`
+	Source     string `json:"source"` // "probe" — a reading we asked for
+	PlanType   string `json:"plan_type,omitempty"`
+	// Family is WHICH limit set these windows belong to (x-codex-active-limit). The account's
+	// active family can change — ours moved from "codex" (5h+7d) to "premium" (one 7-day
+	// window) — and a family with different windows is a different shape, not a different
+	// value. Recording it is what lets the UI say so instead of a bar just going missing.
+	Family    string           `json:"family,omitempty"`
+	Primary   *codexRateWindow `json:"primary,omitempty"`
+	Secondary *codexRateWindow `json:"secondary,omitempty"`
 }
 
 // codexSnapshotFromHeaders maps the x-codex-* response headers onto a snapshot. ok=false when
-// neither window is present (nothing to record).
+// neither slot describes a real window (nothing to record).
 func codexSnapshotFromHeaders(h http.Header) (codexProbeSnapshot, bool) {
 	snap := codexProbeSnapshot{
 		CapturedAt: time.Now().Unix(),
 		Source:     "probe",
 		PlanType:   strings.TrimSpace(h.Get("x-codex-plan-type")),
-		Primary:    codexWindowFromHeaders(h, "primary", 300),
-		Secondary:  codexWindowFromHeaders(h, "secondary", 10080),
+		Family:     strings.TrimSpace(h.Get("x-codex-active-limit")),
+		Primary:    codexWindowFromHeaders(h, "primary"),
+		Secondary:  codexWindowFromHeaders(h, "secondary"),
 	}
 	if snap.Primary == nil && snap.Secondary == nil {
 		return codexProbeSnapshot{}, false
@@ -137,17 +143,23 @@ func codexSnapshotFromHeaders(h http.Header) (codexProbeSnapshot, bool) {
 	return snap, true
 }
 
-// codexWindowFromHeaders reads one window's headers. A missing used-percent means the account
-// does not report that window — nil, never a fabricated zero.
-func codexWindowFromHeaders(h http.Header, slot string, defaultMinutes int) *codexRateWindow {
+// codexWindowFromHeaders reads one slot's headers.
+//
+// A window needs a LENGTH to exist. The account currently reports its unused secondary slot as
+// used-percent=0 with window-minutes=0 and an empty reset — and taking that at face value
+// invented a phantom window, which then collided with the real one and made a bar disappear.
+// A slot is a window only when it says how long it is; anything else is nil, never a
+// fabricated zero, and never a guessed default.
+func codexWindowFromHeaders(h http.Header, slot string) *codexRateWindow {
+	minutes, err := strconv.Atoi(strings.TrimSpace(h.Get("x-codex-" + slot + "-window-minutes")))
+	if err != nil || minutes <= 0 {
+		return nil
+	}
 	used, err := strconv.ParseFloat(strings.TrimSpace(h.Get("x-codex-"+slot+"-used-percent")), 64)
 	if err != nil {
 		return nil
 	}
-	w := &codexRateWindow{UsedPercent: used, WindowMinutes: defaultMinutes}
-	if m, err := strconv.Atoi(strings.TrimSpace(h.Get("x-codex-" + slot + "-window-minutes"))); err == nil && m > 0 {
-		w.WindowMinutes = m
-	}
+	w := &codexRateWindow{UsedPercent: used, WindowMinutes: minutes}
 	if r, err := strconv.ParseInt(strings.TrimSpace(h.Get("x-codex-"+slot+"-reset-at")), 10, 64); err == nil && r > 0 {
 		w.ResetsAt = r
 	}
@@ -191,6 +203,7 @@ func codexProbeReading() *Reading {
 		CapturedAt: time.Unix(snap.CapturedAt, 0),
 		Source:     SourceProbe,
 		Plan:       snap.PlanType,
+		Family:     snap.Family,
 		Billing:    BillingSubscription,
 		Windows:    codexWindows(snap.Primary, snap.Secondary),
 	}

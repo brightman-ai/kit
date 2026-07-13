@@ -70,12 +70,21 @@ type QuotaWindow struct {
 	RemainingPercent float64 `json:"remaining_percent"`
 	// ResetAt is the ISO-8601 time the window resets.
 	ResetAt string `json:"reset_at,omitempty"`
-	// Expired marks a window whose reset time has PASSED since this reading was taken. The
-	// counter has since rolled over, so UsedPercent/RemainingPercent are not merely old —
-	// they are certainly WRONG, and a UI must not paint them as a quantity. Expiry is
-	// per-window on purpose: a runtime's 5h window can roll while its 7d window stays
-	// perfectly valid, and condemning both would throw away a number that is still true.
+	// Expired marks a window whose reset time had PASSED by the time we looked. The counter
+	// rolled over, so the used% we captured is not merely old — it is wrong. Expiry is
+	// per-window on purpose: a 5h window can roll while the 7d window stays perfectly valid,
+	// and condemning both would throw away a number that is still true.
 	Expired bool `json:"expired,omitempty"`
+	// Inferred marks a value we DERIVED rather than observed.
+	//
+	// Only one inference is made, and only for an expired window: the counter rolled, and any
+	// use since would have made the runtime report a fresher reading — none exists, so the
+	// window has not been touched since it reset. Its usage is therefore zero. The reset time
+	// is rolled forward by whole window lengths to the next real boundary.
+	//
+	// This is the ONE place the package computes a number it did not observe, and it is
+	// labelled as such all the way to the UI.
+	Inferred bool `json:"inferred,omitempty"`
 }
 
 // SnapshotMeta describes the reading behind the windows: when it was taken, WHERE it came
@@ -121,7 +130,13 @@ type QuotaInfo struct {
 	Billing string `json:"billing,omitempty"`
 
 	// ── axis 3: the reading
-	Plan    string        `json:"plan,omitempty"`
+	Plan string `json:"plan,omitempty"`
+	// Family names WHICH set of limits these windows belong to. The provider can switch a
+	// codex account between families with different windows ("codex" = 5h+7d, "premium" = one
+	// 7-day window), and when it does, a bar simply disappears. Saying which family is active
+	// is the only way the user can tell "the provider changed my plan's shape" from
+	// "this app broke".
+	Family  string        `json:"family,omitempty"`
 	Windows []QuotaWindow `json:"windows,omitempty"`
 	// Snapshot is nil when no reading has ever been captured.
 	Snapshot *SnapshotMeta `json:"snapshot,omitempty"`
@@ -145,15 +160,40 @@ func (info *QuotaInfo) applyReading(r *Reading) {
 		return
 	}
 	info.Plan = r.Plan
+	info.Family = r.Family
 	if r.Billing != "" {
 		info.Billing = r.Billing
 	}
-	info.Windows = r.Windows
-	info.Snapshot = newSnapshotMeta(r)
+	// Dedupe FIRST, then stamp — the snapshot's expiry marks land on the windows we are going
+	// to publish. (Marking the reading's own slice instead silently drops the flags whenever
+	// dedupe returns a fresh slice.)
+	info.Windows = dedupeWindows(r.Windows)
+	info.Snapshot = newSnapshotMeta(r, info.Windows)
+}
+
+// dedupeWindows keeps one window per kind. Two windows of the same kind is a contradiction —
+// a runtime has one 5h window, not two — and letting both through pushed the contradiction
+// into the UI, where a keyed list silently rendered only one of them and a bar appeared to
+// vanish. Drop the duplicate here, at the boundary, where it is a data fact rather than a
+// rendering accident. The first wins: sources list the real window before any filler.
+func dedupeWindows(windows []QuotaWindow) []QuotaWindow {
+	if len(windows) < 2 {
+		return windows
+	}
+	seen := make(map[string]bool, len(windows))
+	out := make([]QuotaWindow, 0, len(windows))
+	for _, w := range windows {
+		if seen[w.Kind] {
+			continue
+		}
+		seen[w.Kind] = true
+		out = append(out, w)
+	}
+	return out
 }
 
 // newSnapshotMeta stamps a reading with its age, its provenance, and whether it survives.
-func newSnapshotMeta(r *Reading) *SnapshotMeta {
+func newSnapshotMeta(r *Reading, windows []QuotaWindow) *SnapshotMeta {
 	if r == nil || r.CapturedAt.IsZero() {
 		return nil
 	}
@@ -165,7 +205,7 @@ func newSnapshotMeta(r *Reading) *SnapshotMeta {
 	if meta.AgeSeconds < 0 {
 		meta.AgeSeconds = 0
 	}
-	if allExpired := markExpiredWindows(r.Windows); allExpired {
+	if allExpired := markExpiredWindows(windows); allExpired {
 		meta.Stale = true
 		meta.StaleReason = StaleWindowRolled
 		return meta
@@ -177,22 +217,43 @@ func newSnapshotMeta(r *Reading) *SnapshotMeta {
 	return meta
 }
 
-// markExpiredWindows flags every window whose reset has already passed, and reports whether
-// ALL of them have (in which case the reading as a whole is worthless).
+// markExpiredWindows flags every window whose reset has already passed and rolls it forward,
+// reporting whether ALL of them had rolled (in which case the READING as a whole is old news).
+//
+// A rolled window is not simply "unknown": the runtime reports a fresh reading whenever it is
+// used, so a window that rolled with no fresher reading behind it has not been touched since.
+// Its usage is zero, and its next boundary is the old one advanced by whole window lengths.
+// That derivation is marked Inferred so the UI never passes it off as an observation.
 func markExpiredWindows(windows []QuotaWindow) (allExpired bool) {
 	now := time.Now()
-	checked, expired := 0, 0
+	withReset, expired := 0, 0
 	for i := range windows {
-		if windows[i].ResetAt == "" {
+		w := &windows[i]
+		if w.ResetAt == "" {
 			continue
 		}
-		checked++
-		if reset, err := time.Parse(time.RFC3339, windows[i].ResetAt); err == nil && reset.Before(now) {
-			windows[i].Expired = true
-			expired++
+		reset, err := time.Parse(time.RFC3339, w.ResetAt)
+		if err != nil {
+			continue
+		}
+		withReset++
+		if !reset.Before(now) {
+			continue
+		}
+		expired++
+		w.Expired = true
+		w.Inferred = true
+		w.UsedPercent = 0
+		w.RemainingPercent = 100
+		// Roll the boundary forward to the one actually ahead of us.
+		if w.WindowMinutes > 0 {
+			span := time.Duration(w.WindowMinutes) * time.Minute
+			w.ResetAt = reset.Add((now.Sub(reset)/span + 1) * span).UTC().Format(time.RFC3339)
+		} else {
+			w.ResetAt = "" // no window length ⟹ no honest way to say when it next resets
 		}
 	}
-	return checked > 0 && expired == checked
+	return withReset > 0 && expired == withReset
 }
 
 // probeCLI reports whether the named CLI can be executed right now (axis 4 ONLY).

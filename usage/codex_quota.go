@@ -88,6 +88,7 @@ func codexRolloutReading() *Reading {
 		CapturedAt: at,
 		Source:     SourceRollout,
 		Plan:       rl.PlanType,
+		Family:     rl.LimitID,
 		Billing:    BillingSubscription, // a rate-limit family only exists for subscription accounts
 		Windows:    codexWindows(rl.Primary, rl.Secondary),
 	}
@@ -156,12 +157,17 @@ func scanCodexRateLimits(path string) (rl codexRateLimits, capturedAt time.Time,
 }
 
 // codexQuotaWindow maps a codex slot onto the unified QuotaWindow (5h/7d).
+//
+// A slot with no window length is not a window — the label 5h/7d is DERIVED from that length,
+// so without it there is nothing to call the thing. (The account reports its unused secondary
+// slot exactly this way, and treating it as a window invented a phantom that collided with the
+// real one.)
 func codexQuotaWindow(w *codexRateWindow) (QuotaWindow, bool) {
-	if w == nil {
+	if w == nil || w.WindowMinutes <= 0 {
 		return QuotaWindow{}, false
 	}
 	kind := "7d"
-	if w.WindowMinutes > 0 && w.WindowMinutes <= 300 {
+	if w.WindowMinutes <= 300 {
 		kind = "5h"
 	}
 	remaining := 100 - w.UsedPercent
