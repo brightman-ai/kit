@@ -53,10 +53,10 @@ func writeCodexRolloutFixture(t *testing.T, root, date, model string) (wantInput
 		return `{"timestamp":"` + ttl + `","type":"event_msg","payload":{"type":"token_count","info":{` +
 			`"total_token_usage":{"input_tokens":` + strconv.Itoa(total.in) + `,"cached_input_tokens":` + strconv.Itoa(total.cached) +
 			`,"output_tokens":` + strconv.Itoa(total.out) + `,"reasoning_output_tokens":` + strconv.Itoa(total.reasoning) +
-			`,"total_tokens":` + strconv.Itoa(total.in+total.out+total.reasoning) + `},` +
+			`,"total_tokens":` + strconv.Itoa(total.in+total.out) + `},` +
 			`"last_token_usage":{"input_tokens":` + strconv.Itoa(last.in) + `,"cached_input_tokens":` + strconv.Itoa(last.cached) +
 			`,"output_tokens":` + strconv.Itoa(last.out) + `,"reasoning_output_tokens":` + strconv.Itoa(last.reasoning) +
-			`,"total_tokens":` + strconv.Itoa(last.in+last.out+last.reasoning) + `}}}}`
+			`,"total_tokens":` + strconv.Itoa(last.in+last.out) + `}}}}`
 	}
 
 	type tu = struct{ in, cached, out, reasoning int }
@@ -84,8 +84,8 @@ func writeCodexRolloutFixture(t *testing.T, root, date, model string) (wantInput
 		t.Fatalf("write rollout fixture: %v", err)
 	}
 
-	wantInput = 11790 + 26827 + 15037
-	wantOutput = (200 + 10) + (700 + 40) + (300 + 10) // reasoning folds into output
+	wantInput = (11790 - 9000) + (26827 - 11000) + (15037 - 9000)
+	wantOutput = 200 + 700 + 300 // reasoning is already included in output
 	wantCacheRead = 9000 + 11000 + 9000
 	return wantInput, wantOutput, wantCacheRead
 }
@@ -111,7 +111,7 @@ func TestCodexModelScanSource_DedupsInterleavedTotals(t *testing.T) {
 		t.Fatalf("bundle key = (%s,%s), want (%s,gpt-5.4)", b.Date, b.Model, today)
 	}
 	if b.InputTokens != wantIn {
-		t.Errorf("InputTokens = %d, want %d (11790+26827+15037, NOT 11790×4=%d)", b.InputTokens, wantIn, 11790*4)
+		t.Errorf("InputTokens = %d, want %d fresh tokens (inclusive input minus cache)", b.InputTokens, wantIn)
 	}
 	if b.OutputTokens != wantOut {
 		t.Errorf("OutputTokens = %d, want %d", b.OutputTokens, wantOut)

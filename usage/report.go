@@ -36,6 +36,9 @@ type ReportRow struct {
 	Cost *float64 `json:"cost"`
 	// Currency for Cost ("USD"|"CNY"|""). Empty when Cost is nil.
 	Currency string `json:"currency,omitempty"`
+	// Costs is the lossless multi-currency projection. Cost remains populated
+	// only when this bucket has exactly one currency.
+	Costs map[string]float64 `json:"costs,omitempty"`
 }
 
 // ReportSummary holds aggregate totals for the window.
@@ -46,8 +49,9 @@ type ReportSummary struct {
 	CacheCreateTokens int64 `json:"cache_create_tokens"`
 	TotalTokens       int64 `json:"total_tokens"`
 	// Cost / Currency: window total estimated cost. Cost nil → no priced model.
-	Cost     *float64 `json:"cost"`
-	Currency string   `json:"currency,omitempty"`
+	Cost     *float64           `json:"cost"`
+	Currency string             `json:"currency,omitempty"`
+	Costs    map[string]float64 `json:"costs,omitempty"`
 	// CostComplete is false when ≥1 model in the window had NO price row (so the
 	// shown cost UNDER-counts). UI may flag "≈" / "部分模型无价" honestly.
 	CostComplete bool `json:"cost_complete"`
@@ -60,14 +64,19 @@ type ProviderRow struct {
 	// Provider is the display key (e.g. "Claude" / "OpenAI" / "Gemini").
 	Provider string `json:"provider"`
 	// Runtime is the canonical runtime kind ("claude"|"codex"|"gemini"|"other").
-	Runtime           string   `json:"runtime"`
-	InputTokens       int64    `json:"input_tokens"`
-	OutputTokens      int64    `json:"output_tokens"`
-	CacheReadTokens   int64    `json:"cache_read_tokens"`
-	CacheCreateTokens int64    `json:"cache_create_tokens"`
-	TotalTokens       int64    `json:"total_tokens"`
-	Cost              *float64 `json:"cost"`
-	Currency          string   `json:"currency,omitempty"`
+	Runtime string `json:"runtime"`
+	// BillingMode is request-time evidence (subscription|api|unknown). A runtime
+	// may therefore produce multiple rows in one window after an auth switch.
+	BillingMode       string             `json:"billing_mode"`
+	BillingCoverage   string             `json:"billing_coverage"`
+	InputTokens       int64              `json:"input_tokens"`
+	OutputTokens      int64              `json:"output_tokens"`
+	CacheReadTokens   int64              `json:"cache_read_tokens"`
+	CacheCreateTokens int64              `json:"cache_create_tokens"`
+	TotalTokens       int64              `json:"total_tokens"`
+	Cost              *float64           `json:"cost"`
+	Currency          string             `json:"currency,omitempty"`
+	Costs             map[string]float64 `json:"costs,omitempty"`
 	// TopModel is the highest-token model id under this provider (主要消耗).
 	TopModel string `json:"top_model,omitempty"`
 	// Spark is the per-day total-token trend for this provider (oldest-first).

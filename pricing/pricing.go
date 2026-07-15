@@ -31,6 +31,7 @@ package pricing
 import (
 	"sort"
 	"strings"
+	"time"
 )
 
 // Tier is the per-MILLION-token unit prices for one billing tier.
@@ -170,16 +171,32 @@ func stripBedrockVersion(m string) string {
 	return m[:i]
 }
 
-// Lookup normalizes model and returns its price via longest-key-first
-// prefix/substring matching against the embedded table. The second result is
-// false when no family matches — callers MUST NOT guess a price in that case.
+// Lookup returns the currently effective standard-tier price. New request-level
+// code should call LookupAt with the request timestamp and service tier so
+// historical prices and priority processing remain auditable.
 func Lookup(model string) (ModelPrice, bool) {
+	return LookupAt(model, time.Now().UTC(), "standard")
+}
+
+// LookupAt resolves effective-dated request pricing first, then the stable
+// legacy table. Unknown OpenAI/Anthropic families do not inherit a generic rate.
+func LookupAt(model string, at time.Time, serviceTier string) (ModelPrice, bool) {
+	if quote, ok := DefaultCatalog().Quote(RequestQuery{Model: model, At: at, ServiceTier: serviceTier}); ok {
+		return quote.Price, true
+	}
+	if normalizeServiceTier(serviceTier) != "standard" {
+		return ModelPrice{}, false
+	}
+	return lookupLegacy(model)
+}
+
+func lookupLegacy(model string) (ModelPrice, bool) {
 	m := normalize(model)
 	if m == "" {
 		return ModelPrice{}, false
 	}
 	for _, e := range sortedTable {
-		if strings.Contains(m, e.key) {
+		if m == e.key || strings.HasPrefix(m, e.key+"-") {
 			return e.price, true
 		}
 	}
@@ -196,7 +213,19 @@ func Lookup(model string) (ModelPrice, bool) {
 // CacheWrite1hPerM == 0). When the model is unknown, ok is false and cost is 0 —
 // the cost is NEVER guessed from a fallback price.
 func Cost(model string, u Usage) (cost float64, currency string, ok bool) {
-	p, found := Lookup(model)
+	return CostAt(RequestQuery{Model: model, At: time.Now().UTC(), ServiceTier: "standard"}, u)
+}
+
+// CostAt prices one request with its timestamp and billing service tier.
+func CostAt(q RequestQuery, u Usage) (cost float64, currency string, ok bool) {
+	if quote, found := DefaultCatalog().Quote(q); found {
+		cost, currency = quote.Cost(u)
+		return cost, currency, true
+	}
+	if normalizeServiceTier(q.ServiceTier) != "standard" {
+		return 0, "", false
+	}
+	p, found := lookupLegacy(q.Model)
 	if !found {
 		return 0, "", false
 	}
@@ -207,15 +236,6 @@ func Cost(model string, u Usage) (cost float64, currency string, ok bool) {
 		tier = *p.Above
 	}
 
-	cw1h := tier.CacheWrite1hPerM
-	if cw1h == 0 {
-		cw1h = tier.CacheWrite5mPerM // 0 → fall back to the 5m rate
-	}
-
-	cost = float64(u.Input)*tier.InputPerM/1e6 +
-		float64(u.Output)*tier.OutputPerM/1e6 +
-		float64(u.CacheRead)*tier.CacheReadPerM/1e6 +
-		float64(u.CacheWrite5m)*tier.CacheWrite5mPerM/1e6 +
-		float64(u.CacheWrite1h)*cw1h/1e6
+	cost = tierCost(tier, u)
 	return cost, p.Currency, true
 }

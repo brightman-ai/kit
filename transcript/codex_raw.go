@@ -2,8 +2,10 @@ package transcript
 
 import (
 	"encoding/json"
+	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // codexLine is the union shape of one line in a codex rollout-*.jsonl. Every
@@ -178,7 +180,10 @@ func (l *codexLine) asTokenCount() *codexTokenCount {
 // /model). Other turn_context fields (sandbox_policy, approval_policy, ...)
 // are intentionally not modeled here — add them if a future consumer needs them.
 type codexTurnContext struct {
-	Model string `json:"model"`
+	Model           string `json:"model"`
+	ReasoningEffort string `json:"reasoning_effort"`
+	Effort          string `json:"effort"`
+	ServiceTier     string `json:"service_tier"`
 }
 
 func (l *codexLine) asTurnContext() *codexTurnContext {
@@ -199,13 +204,20 @@ func (u *codexTokenUsage) usageMap() map[string]interface{} {
 		return nil
 	}
 	m := map[string]interface{}{}
-	if u.InputTokens != 0 {
-		m["input_tokens"] = u.InputTokens
+	// Codex input_tokens is INCLUSIVE of cached_input_tokens. The provider-neutral
+	// contract uses mutually-exclusive token classes (like Claude), so input means
+	// fresh/uncached input and cached input is surfaced once in its own class.
+	if in := u.InputTokens - u.CachedInputTokens; in > 0 {
+		m["input_tokens"] = in
 	}
-	// codex counts reasoning tokens separately; fold into output to match how
-	// claude's output_tokens already includes reasoning (one comparable number).
-	if out := u.OutputTokens + u.ReasoningOutputTokens; out != 0 {
-		m["output_tokens"] = out
+	// output_tokens is already inclusive of reasoning_output_tokens (the wire's
+	// total_tokens equals input_tokens + output_tokens). Reasoning is a breakdown,
+	// not a second billed bucket.
+	if u.OutputTokens != 0 {
+		m["output_tokens"] = u.OutputTokens
+	}
+	if u.ReasoningOutputTokens != 0 {
+		m["thinking_tokens"] = u.ReasoningOutputTokens
 	}
 	if u.CachedInputTokens != 0 {
 		m["cache_read_input_tokens"] = u.CachedInputTokens
@@ -326,6 +338,285 @@ func codexPatchPath(input string) string {
 	}
 	return ""
 }
+
+// codexExecCommand projects Codex's custom exec wrapper onto the canonical
+// tool_input.command field. The wrapper is JavaScript, not JSON:
+//
+//	const r = await tools.exec_command({ cmd: "rg ...", workdir: "..." });
+//
+// We do not execute or generally parse JavaScript. This bounded scanner recognizes
+// only the generated call/object grammar, balances strings/comments/nesting, and
+// decodes a top-level cmd string (or string array). Failure is an honest empty result;
+// the caller keeps the lossless raw input alongside the optional projection.
+func codexExecCommand(input string) string {
+	const maxScan = 1 << 20
+	if len(input) > maxScan {
+		input = input[:maxScan]
+	}
+	const call = "tools.exec_command"
+	for search := 0; search < len(input); {
+		rel := strings.Index(input[search:], call)
+		if rel < 0 {
+			return ""
+		}
+		start := search + rel + len(call)
+		i := skipJSSpace(input, start)
+		if i >= len(input) || input[i] != '(' {
+			search = start
+			continue
+		}
+		i = skipJSSpace(input, i+1)
+		if i >= len(input) || input[i] != '{' {
+			search = start
+			continue
+		}
+		if cmd := scanJSObjectCommand(input, i); cmd != "" {
+			return cmd
+		}
+		search = start
+	}
+	return ""
+}
+
+func scanJSObjectCommand(s string, objectStart int) string {
+	brace, bracket, paren := 1, 0, 0
+	previous := byte('{')
+	for i := objectStart + 1; i < len(s); {
+		i = skipJSSpace(s, i)
+		if i >= len(s) {
+			break
+		}
+		ch := s[i]
+		if brace == 1 && bracket == 0 && paren == 0 && (previous == '{' || previous == ',') {
+			key, end, ok := scanJSPropertyKey(s, i)
+			if ok {
+				colon := skipJSSpace(s, end)
+				if colon < len(s) && s[colon] == ':' {
+					if key == "cmd" {
+						if value, _, ok := scanJSCommandValue(s, skipJSSpace(s, colon+1)); ok {
+							return strings.TrimSpace(value)
+						}
+						return ""
+					}
+				}
+			}
+		}
+		switch ch {
+		case '\'', '"', '`':
+			_, next, ok := scanJSQuoted(s, i)
+			if !ok {
+				return ""
+			}
+			i = next
+			previous = 'v'
+			continue
+		case '{':
+			brace++
+		case '}':
+			brace--
+			if brace == 0 {
+				return ""
+			}
+		case '[':
+			bracket++
+		case ']':
+			if bracket > 0 {
+				bracket--
+			}
+		case '(':
+			paren++
+		case ')':
+			if paren > 0 {
+				paren--
+			}
+		}
+		if brace == 1 && bracket == 0 && paren == 0 && (ch == '{' || ch == ',') {
+			previous = ch
+		} else if ch != ' ' && ch != '\t' && ch != '\r' && ch != '\n' {
+			previous = ch
+		}
+		i++
+	}
+	return ""
+}
+
+func scanJSPropertyKey(s string, start int) (string, int, bool) {
+	if start >= len(s) {
+		return "", start, false
+	}
+	if s[start] == '\'' || s[start] == '"' {
+		value, end, ok := scanJSQuoted(s, start)
+		return value, end, ok
+	}
+	if !isJSIdentStart(s[start]) {
+		return "", start, false
+	}
+	end := start + 1
+	for end < len(s) && isJSIdentPart(s[end]) {
+		end++
+	}
+	return s[start:end], end, true
+}
+
+func scanJSCommandValue(s string, start int) (string, int, bool) {
+	if start >= len(s) {
+		return "", start, false
+	}
+	if s[start] == '\'' || s[start] == '"' || s[start] == '`' {
+		return scanJSQuoted(s, start)
+	}
+	if s[start] != '[' {
+		return "", start, false
+	}
+	var values []string
+	for i := start + 1; i < len(s); {
+		i = skipJSSpace(s, i)
+		if i >= len(s) {
+			break
+		}
+		if s[i] == ']' {
+			return strings.Join(values, " "), i + 1, len(values) > 0
+		}
+		if s[i] != '\'' && s[i] != '"' && s[i] != '`' {
+			return "", i, false
+		}
+		value, next, ok := scanJSQuoted(s, i)
+		if !ok {
+			return "", i, false
+		}
+		values = append(values, value)
+		i = skipJSSpace(s, next)
+		if i < len(s) && s[i] == ',' {
+			i++
+			continue
+		}
+		if i < len(s) && s[i] == ']' {
+			return strings.Join(values, " "), i + 1, true
+		}
+		return "", i, false
+	}
+	return "", start, false
+}
+
+func scanJSQuoted(s string, start int) (string, int, bool) {
+	if start >= len(s) {
+		return "", start, false
+	}
+	quote := s[start]
+	for i := start + 1; i < len(s); i++ {
+		if s[i] == '\\' {
+			i++
+			continue
+		}
+		if s[i] == quote {
+			raw := s[start : i+1]
+			if quote == '"' {
+				if value, err := strconv.Unquote(raw); err == nil {
+					return value, i + 1, true
+				}
+			}
+			return decodeJSQuotedFallback(raw), i + 1, true
+		}
+		if quote != '`' && (s[i] == '\n' || s[i] == '\r') {
+			return "", i, false
+		}
+	}
+	return "", start, false
+}
+
+func decodeJSQuotedFallback(raw string) string {
+	if len(raw) < 2 {
+		return ""
+	}
+	body := raw[1 : len(raw)-1]
+	var b strings.Builder
+	for i := 0; i < len(body); i++ {
+		if body[i] != '\\' || i+1 >= len(body) {
+			b.WriteByte(body[i])
+			continue
+		}
+		i++
+		switch body[i] {
+		case 'n':
+			b.WriteByte('\n')
+		case 'r':
+			b.WriteByte('\r')
+		case 't':
+			b.WriteByte('\t')
+		case 'b':
+			b.WriteByte('\b')
+		case 'f':
+			b.WriteByte('\f')
+		case 'v':
+			b.WriteByte('\v')
+		case '\n': // JavaScript line continuation
+		case '\r':
+			if i+1 < len(body) && body[i+1] == '\n' {
+				i++
+			}
+		case 'x':
+			if i+2 < len(body) {
+				if v, err := strconv.ParseUint(body[i+1:i+3], 16, 8); err == nil {
+					b.WriteByte(byte(v))
+					i += 2
+					break
+				}
+			}
+			b.WriteByte('x')
+		case 'u':
+			if i+4 < len(body) {
+				if v, err := strconv.ParseUint(body[i+1:i+5], 16, 16); err == nil {
+					var buf [utf8.UTFMax]byte
+					n := utf8.EncodeRune(buf[:], rune(v))
+					b.Write(buf[:n])
+					i += 4
+					break
+				}
+			}
+			b.WriteByte('u')
+		default:
+			b.WriteByte(body[i])
+		}
+	}
+	return b.String()
+}
+
+func skipJSSpace(s string, start int) int {
+	for i := start; i < len(s); {
+		switch s[i] {
+		case ' ', '\t', '\r', '\n':
+			i++
+		case '/':
+			if i+1 >= len(s) {
+				return i
+			}
+			if s[i+1] == '/' {
+				i += 2
+				for i < len(s) && s[i] != '\n' {
+					i++
+				}
+				continue
+			}
+			if s[i+1] == '*' {
+				end := strings.Index(s[i+2:], "*/")
+				if end < 0 {
+					return len(s)
+				}
+				i += end + 4
+				continue
+			}
+			return i
+		default:
+			return i
+		}
+	}
+	return len(s)
+}
+
+func isJSIdentStart(ch byte) bool {
+	return ch == '_' || ch == '$' || ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z'
+}
+func isJSIdentPart(ch byte) bool { return isJSIdentStart(ch) || ch >= '0' && ch <= '9' }
 
 // isCodexNoise filters the non-user wrapper messages codex injects as user-role
 // response_items (AGENTS.md preamble, environment_context, permissions, etc.).

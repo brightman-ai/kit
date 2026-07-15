@@ -13,9 +13,9 @@
 //     the UI said it was fine. We therefore select the UNNAMED (account) family and ignore
 //     named per-model limits.
 //
-//  2. The newest file's newest ACCOUNT entry is not its last line, and may not even be in
-//     the newest file. We take the entry with the greatest EVENT timestamp across the few
-//     most recent rollouts, and use that timestamp as the reading's capture time — so
+//  2. The newest file's newest ACCOUNT entry for a family is not its last line, and may not
+//     even be in the newest file. We take the greatest EVENT timestamp per account family
+//     across the few most recent rollouts, and use it as each reading's capture time — so
 //     "更新于 …" tells the truth instead of tracking a file's mtime.
 //
 // Read-only, no API call, no auth: the same data `codex /status` shows is already on disk.
@@ -72,26 +72,34 @@ type codexRolloutLine struct {
 	} `json:"payload"`
 }
 
-// codexRolloutReading returns the most recent ACCOUNT reading codex has written to a rollout.
-// nil when it has never written one.
+// codexRolloutReadings returns the newest ACCOUNT reading for EACH limit family observed in
+// recent rollouts. A newer "codex" observation must not erase an older "premium" family —
+// they are independent counters with different window shapes.
 //
 // This source only moves when CODEX chooses to move it, which is the trap: codex records the
 // rate-limit family of the model it is currently RUNNING, so a session on a per-model plan
 // (GPT-5.3-Codex-Spark) leaves the account limit frozen at whatever it was before the switch.
 // No amount of re-reading helps — that is what the probe is for.
+func codexRolloutReadings() []*Reading {
+	observations := latestCodexRateLimitsByFamily(codexSessionsDir())
+	readings := make([]*Reading, 0, len(observations))
+	for _, observation := range observations {
+		rl := observation.RateLimits
+		readings = append(readings, &Reading{
+			CapturedAt: observation.CapturedAt,
+			Source:     SourceRollout,
+			Plan:       rl.PlanType,
+			Family:     rl.LimitID,
+			Billing:    BillingSubscription,
+			Windows:    codexWindows(rl.Primary, rl.Secondary),
+		})
+	}
+	return newestReadingsByFamily(readings...)
+}
+
+// codexRolloutReading is the compatibility projection used by older package callers/tests.
 func codexRolloutReading() *Reading {
-	rl, at, ok := latestCodexRateLimits(codexSessionsDir())
-	if !ok {
-		return nil
-	}
-	return &Reading{
-		CapturedAt: at,
-		Source:     SourceRollout,
-		Plan:       rl.PlanType,
-		Family:     rl.LimitID,
-		Billing:    BillingSubscription, // a rate-limit family only exists for subscription accounts
-		Windows:    codexWindows(rl.Primary, rl.Secondary),
-	}
+	return newestReading(codexRolloutReadings()...)
 }
 
 // codexWindows maps codex's primary/secondary slots onto the unified windows.
@@ -109,22 +117,50 @@ func codexWindows(primary, secondary *codexRateWindow) []QuotaWindow {
 // latestCodexRateLimits returns the most recent ACCOUNT rate-limit reading across the few
 // newest rollouts, along with when it was captured. ok=false when no such reading exists.
 func latestCodexRateLimits(root string) (rl codexRateLimits, capturedAt time.Time, ok bool) {
-	for _, path := range transcript.NewestFiles(root, transcript.RolloutPrefix, transcript.JSONLSuffix, codexScanFiles) {
-		candidate, at, found := scanCodexRateLimits(path)
-		if !found {
-			continue
-		}
-		if !ok || at.After(capturedAt) {
-			rl, capturedAt, ok = candidate, at, true
+	for _, observation := range latestCodexRateLimitsByFamily(root) {
+		if !ok || observation.CapturedAt.After(capturedAt) {
+			rl, capturedAt, ok = observation.RateLimits, observation.CapturedAt, true
 		}
 	}
 	return rl, capturedAt, ok
+}
+
+type codexRateLimitObservation struct {
+	RateLimits codexRateLimits
+	CapturedAt time.Time
+}
+
+func latestCodexRateLimitsByFamily(root string) []codexRateLimitObservation {
+	byFamily := make(map[string]codexRateLimitObservation)
+	for _, path := range transcript.NewestFiles(root, transcript.RolloutPrefix, transcript.JSONLSuffix, codexScanFiles) {
+		for family, candidate := range scanCodexRateLimitsByFamily(path) {
+			current, exists := byFamily[family]
+			if !exists || candidate.CapturedAt.After(current.CapturedAt) {
+				byFamily[family] = candidate
+			}
+		}
+	}
+	out := make([]codexRateLimitObservation, 0, len(byFamily))
+	for _, observation := range byFamily {
+		out = append(out, observation)
+	}
+	return out
 }
 
 // scanCodexRateLimits reads the tail of one rollout and returns its newest ACCOUNT reading
 // (by event timestamp) plus that timestamp. Per-model sub-limits are skipped — see the file
 // header for why reading them silently reports the wrong quota.
 func scanCodexRateLimits(path string) (rl codexRateLimits, capturedAt time.Time, ok bool) {
+	for _, observation := range scanCodexRateLimitsByFamily(path) {
+		if !ok || observation.CapturedAt.After(capturedAt) {
+			rl, capturedAt, ok = observation.RateLimits, observation.CapturedAt, true
+		}
+	}
+	return rl, capturedAt, ok
+}
+
+func scanCodexRateLimitsByFamily(path string) map[string]codexRateLimitObservation {
+	byFamily := make(map[string]codexRateLimitObservation)
 	needle := []byte("rate_limits")
 	_ = transcript.ScanTail(path, transcript.DefaultTailBytes, func(line []byte) bool {
 		if !bytes.Contains(line, needle) {
@@ -142,18 +178,23 @@ func scanCodexRateLimits(path string) (rl codexRateLimits, capturedAt time.Time,
 			return true // a per-model sub-limit — reading it would report the wrong quota
 		}
 		at, _ := time.Parse(time.RFC3339, row.Timestamp)
-		if !ok || at.After(capturedAt) {
-			rl, capturedAt, ok = *candidate, at, true
+		family := candidate.LimitID
+		current, exists := byFamily[family]
+		if !exists || at.After(current.CapturedAt) {
+			byFamily[family] = codexRateLimitObservation{RateLimits: *candidate, CapturedAt: at}
 		}
 		return true
 	})
-	if ok && capturedAt.IsZero() {
-		// A reading with no parseable timestamp still beats none; fall back to the file's mtime.
-		if fi, err := os.Stat(path); err == nil {
-			capturedAt = fi.ModTime()
+	// A reading with no parseable timestamp still beats none; fall back to the file's mtime.
+	if fi, err := os.Stat(path); err == nil {
+		for family, observation := range byFamily {
+			if observation.CapturedAt.IsZero() {
+				observation.CapturedAt = fi.ModTime()
+				byFamily[family] = observation
+			}
 		}
 	}
-	return rl, capturedAt, ok
+	return byFamily
 }
 
 // codexQuotaWindow maps a codex slot onto the unified QuotaWindow (5h/7d).

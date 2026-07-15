@@ -2,9 +2,10 @@
 //
 // A runtime's quota is assembled from READINGS, and served by a PROVIDER.
 //
-//	Reading  — one observation of the account's windows, with a time and a provenance.
-//	           Several sources can produce one (a statusline hook, a rollout transcript, a
-//	           live probe); the freshest wins, and the winner remembers where it came from.
+//	Reading  — one observation of one account quota family's windows, with a time and a
+//	           provenance. Several sources can produce one (a statusline hook, a rollout
+//	           transcript, a live probe); the freshest wins inside that family, and the winner
+//	           remembers where it came from.
 //	Provider — one runtime's quota domain: how to observe it offline, and whether it can be
 //	           asked directly.
 //
@@ -19,6 +20,7 @@ package usage
 
 import (
 	"context"
+	"sort"
 	"time"
 )
 
@@ -39,10 +41,9 @@ type Reading struct {
 	Billing    string // BillingSubscription | BillingAPI — an api reading has no windows by design
 	// Family is WHICH set of limits this reading describes. Codex accounts have several
 	// ("codex" = 5h+7d, "premium" = a single 7-day window, plus per-model families), and the
-	// provider switches which one is ACTIVE. Two families are not two views of one truth —
+	// provider can expose more than one over time. Two families are not two views of one truth —
 	// they have different windows entirely — so readings from different families must never
-	// be merged window-by-window. The freshest reading wins whole, and it says which family
-	// it speaks for, because "why did my 5h bar disappear?" has no other answer.
+	// be merged or overwrite each other. Freshness only chooses a winner inside one family.
 	Family  string
 	Windows []QuotaWindow
 }
@@ -62,6 +63,38 @@ func newestReading(readings ...*Reading) *Reading {
 		}
 	}
 	return best
+}
+
+// newestReadingsByFamily keeps one independently-current reading per quota family.
+//
+// A family is part of a reading's identity, not decoration. "premium" and "codex" can
+// coexist for the same account (different models are governed by different limit sets), so a
+// newer observation of one must never erase the other. Time only resolves competing sources
+// WITHIN one family. The returned slice is newest-first so callers have a deterministic
+// compatibility projection for consumers that still understand only one reading.
+func newestReadingsByFamily(readings ...*Reading) []*Reading {
+	byFamily := make(map[string]*Reading)
+	for _, r := range readings {
+		if r == nil {
+			continue
+		}
+		current := byFamily[r.Family]
+		if current == nil || r.CapturedAt.After(current.CapturedAt) {
+			byFamily[r.Family] = r
+		}
+	}
+
+	out := make([]*Reading, 0, len(byFamily))
+	for _, r := range byFamily {
+		out = append(out, r)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CapturedAt.Equal(out[j].CapturedAt) {
+			return out[i].Family < out[j].Family
+		}
+		return out[i].CapturedAt.After(out[j].CapturedAt)
+	})
+	return out
 }
 
 // QuotaProvider is one runtime's quota domain.

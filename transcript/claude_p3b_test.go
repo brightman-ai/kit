@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // TestParseTaskNotification verifies the `<task-notification>` envelope parser
@@ -138,6 +139,9 @@ func TestLoadTranscript_TaskNotificationAndAgentDuration(t *testing.T) {
 	}
 	if agent.DurationMs != 100_000 {
 		t.Errorf("agent duration: got %d want 100000 (12:00:00→12:01:40)", agent.DurationMs)
+	}
+	if agent.StartedAt == nil || agent.EndedAt == nil || agent.EndedAt.Sub(*agent.StartedAt) != 100*time.Second {
+		t.Errorf("agent timestamps: start=%v end=%v", agent.StartedAt, agent.EndedAt)
 	}
 	if agent.InTokens != 0 || agent.OutTokens != 0 {
 		t.Errorf("agent tokens must stay 0 (claude does not inline subagent usage): in=%d out=%d",

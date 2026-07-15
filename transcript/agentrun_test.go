@@ -111,9 +111,12 @@ func TestProjectAgentRuns_CodexToolLoop12(t *testing.T) {
 	if got := countSegments(r, BlockUsage); got != 0 {
 		t.Errorf("usage must be absorbed into the run aggregate, found %d usage segments", got)
 	}
-	// 6 token_count deltas × (100 in / 10 out) → the run's single aggregate.
-	if r.Usage == nil || r.Usage.InputTokens != 600 {
-		t.Errorf("run input_tokens = %v, want 600 (6 deltas × 100)", r.Usage)
+	// Codex input is inclusive of cache: each delta is 95 fresh + 5 cached.
+	if r.Usage == nil || r.Usage.InputTokens != 570 {
+		t.Errorf("run fresh input_tokens = %v, want 570 (6 deltas × 95)", r.Usage)
+	}
+	if r.Usage.CacheReadTokens != 30 {
+		t.Errorf("run cache_read_tokens = %d, want 30", r.Usage.CacheReadTokens)
 	}
 	if r.Usage.OutputTokens != 60 {
 		t.Errorf("run output_tokens = %d, want 60", r.Usage.OutputTokens)

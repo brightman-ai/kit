@@ -225,6 +225,11 @@ type Block struct {
 	// Orphan: a tool_result with no matching call in this transcript. Kept (never dropped)
 	// + counted in RunDiagnostic, so a lossy source degrades visibly.
 	Orphan bool `json:"orphan,omitempty"`
+	// StartedAt/EndedAt preserve the provider-observed tool_use→tool_result
+	// interval. They belong to the source fact, not the UI; an unmatched call
+	// deliberately has no EndedAt and must never enter completed-latency averages.
+	StartedAt *time.Time `json:"started_at,omitempty"`
+	EndedAt   *time.Time `json:"ended_at,omitempty"`
 
 	// agent (Agent tool_use → subagent). SubagentType is the dispatched agent
 	// kind; Description is the human-readable task; the inner subflow blocks are
@@ -233,13 +238,10 @@ type Block struct {
 	Description  string  `json:"description,omitempty"`
 	Children     []Block `json:"children,omitempty"`
 
-	// agent usage/timing (CHG-014 P3b — Gap-4). DurationMs is the wall-clock
-	// delta between the Agent tool_use line and its tool_result line — the only
-	// honest end-to-end subagent timing available from the parent jsonl (claude
-	// does not inline the subagent's own usage; sidechain transcripts are absent
-	// in practice). InTokens/OutTokens stay 0 (→ omitted → frontend "—") unless a
-	// future source supplies the subagent's own usage. Honest-degradation rule:
-	// never fabricate token counts (SPEC-UX-ROUND3 §5).
+	// DurationMs is the provider-observed wall-clock delta between tool_use and
+	// tool_result for every tool. For Agent blocks it is also the only honest
+	// parent-visible subagent duration. InTokens/OutTokens stay 0 unless a future
+	// source supplies the subagent's own usage.
 	DurationMs int `json:"duration_ms,omitempty"`
 	InTokens   int `json:"in_tokens,omitempty"`
 	OutTokens  int `json:"out_tokens,omitempty"`

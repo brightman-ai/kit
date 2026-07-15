@@ -485,6 +485,11 @@ func (s *CodexSource) loadTranscriptReader(ctx context.Context, reader io.Reader
 						if p := codexPatchPath(c.Input); p != "" {
 							input["path"] = p
 						}
+						if c.Name == "exec" {
+							if command := codexExecCommand(c.Input); command != "" {
+								input["command"] = command
+							}
+						}
 					}
 					appendCodexToolCall(tr, pending, at, c.Name, c.CallID, input)
 				}
@@ -498,7 +503,7 @@ func (s *CodexSource) loadTranscriptReader(ctx context.Context, reader io.Reader
 							Index: len(tr.Turns), Role: "assistant", At: tsPtr(at),
 							Blocks: []Block{{
 								Type: BlockTool, EventID: o.CallID, ToolUseID: o.CallID,
-								ToolResult: o.text(), ResultSeen: true, Orphan: true,
+								ToolResult: o.text(), ResultSeen: true, Orphan: true, EndedAt: tsPtr(at),
 							}},
 						})
 						continue
@@ -506,6 +511,12 @@ func (s *CodexSource) loadTranscriptReader(ctx context.Context, reader io.Reader
 					blk := &tr.Turns[loc.t].Blocks[loc.b]
 					blk.ToolResult = o.text()
 					blk.ResultSeen = true // it actually completed (vs. cut off by an abort)
+					blk.EndedAt = tsPtr(at)
+					if !loc.useAt.IsZero() && !at.IsZero() {
+						if d := at.Sub(loc.useAt).Milliseconds(); d > 0 {
+							blk.DurationMs = int(d)
+						}
+					}
 					delete(pending, o.CallID)
 				}
 			}
@@ -697,10 +708,10 @@ func markCodexFinalText(tr *Transcript, from int) {
 func appendCodexToolCall(tr *Transcript, pending map[string]toolLoc, at time.Time, name, callID string, input map[string]interface{}) {
 	turn := Turn{
 		Index: len(tr.Turns), Role: "assistant", At: tsPtr(at),
-		Blocks: []Block{{Type: BlockTool, ToolName: name, ToolUseID: callID, ToolInput: input}},
+		Blocks: []Block{{Type: BlockTool, ToolName: name, ToolUseID: callID, ToolInput: input, StartedAt: tsPtr(at)}},
 	}
 	tr.Turns = append(tr.Turns, turn)
-	pending[callID] = toolLoc{t: len(tr.Turns) - 1, b: 0}
+	pending[callID] = toolLoc{t: len(tr.Turns) - 1, b: 0, useAt: at}
 }
 
 // RolloutPathFor returns the absolute rollout-*.jsonl path for a codex session id
@@ -752,7 +763,7 @@ func idFromRolloutName(name string) string {
 type CodexModelUsage struct {
 	At              time.Time
 	Model           string
-	InputTokens     int
+	InputTokens     int // fresh/uncached input; cached input is separate below
 	OutputTokens    int
 	CacheReadTokens int
 }

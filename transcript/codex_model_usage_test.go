@@ -57,19 +57,20 @@ func TestScanCodexModelUsage_ModelSwitchAndDedup(t *testing.T) {
 		t.Fatalf("expected 3 usage events (zero-delta repeats skipped), got %d: %+v", len(events), events)
 	}
 
-	if events[0].Model != "gpt-5.4" || events[0].InputTokens != 11790 || events[0].CacheReadTokens != 9000 {
-		t.Errorf("event[0] (pre-switch) = %+v, want model=gpt-5.4 input=11790 cacheRead=9000", events[0])
+	if events[0].Model != "gpt-5.4" || events[0].InputTokens != 2790 || events[0].CacheReadTokens != 9000 {
+		t.Errorf("event[0] (pre-switch) = %+v, want model=gpt-5.4 freshInput=2790 cacheRead=9000", events[0])
 	}
-	// output folds reasoning_output_tokens: 200+10=210
-	if events[0].OutputTokens != 210 {
-		t.Errorf("event[0].OutputTokens = %d, want 210 (200+10 reasoning)", events[0].OutputTokens)
+	// Codex output_tokens already includes reasoning; the reasoning field is only
+	// a breakdown and must not be billed twice.
+	if events[0].OutputTokens != 200 {
+		t.Errorf("event[0].OutputTokens = %d, want inclusive output 200", events[0].OutputTokens)
 	}
 
-	if events[1].Model != "gpt-5.5" || events[1].InputTokens != 26827 {
-		t.Errorf("event[1] (post-switch) = %+v, want model=gpt-5.5 input=26827", events[1])
+	if events[1].Model != "gpt-5.5" || events[1].InputTokens != 15827 {
+		t.Errorf("event[1] (post-switch) = %+v, want model=gpt-5.5 freshInput=15827", events[1])
 	}
-	if events[2].Model != "gpt-5.5" || events[2].InputTokens != 15037 {
-		t.Errorf("event[2] (post-switch) = %+v, want model=gpt-5.5 input=15037", events[2])
+	if events[2].Model != "gpt-5.5" || events[2].InputTokens != 6037 {
+		t.Errorf("event[2] (post-switch) = %+v, want model=gpt-5.5 freshInput=6037", events[2])
 	}
 
 	// Sum-by-model must equal the real per-turn deltas, NOT the cumulative totals
@@ -83,10 +84,10 @@ func TestScanCodexModelUsage_ModelSwitchAndDedup(t *testing.T) {
 			gpt55In += e.InputTokens
 		}
 	}
-	if gpt54In != 11790 {
-		t.Errorf("gpt-5.4 total input = %d, want 11790 (dedup of 4 repeated cumulative snapshots)", gpt54In)
+	if gpt54In != 2790 {
+		t.Errorf("gpt-5.4 fresh input = %d, want 2790 (inclusive input minus cache)", gpt54In)
 	}
-	if gpt55In != 26827+15037 {
-		t.Errorf("gpt-5.5 total input = %d, want %d", gpt55In, 26827+15037)
+	if gpt55In != 15827+6037 {
+		t.Errorf("gpt-5.5 fresh input = %d, want %d", gpt55In, 15827+6037)
 	}
 }

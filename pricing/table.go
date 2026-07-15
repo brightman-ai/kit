@@ -2,8 +2,9 @@ package pricing
 
 // priceTable is the embedded snapshot of model prices, in USD (or CNY) per MILLION
 // tokens, validated against LiteLLM's model_prices_and_context_window.json (the same
-// source ccusage uses). Keys are canonical lowercase model ids; the slice carries
-// both specific ids and generic family fallbacks.
+// source ccusage uses). Keys are canonical lowercase model ids. OpenAI and
+// Anthropic intentionally have no generic family fallbacks: an unknown future
+// model is unpriced until a verified rule is added.
 //
 // Source order here is irrelevant: Lookup matches longest-key-first (see
 // buildSortedTable), so a specific id (e.g. "claude-opus-4-8") always wins over a
@@ -43,12 +44,6 @@ var priceTable = []priceEntry{
 	{"claude-fable", ModelPrice{Tier: Tier{10, 50, 1, 12.5, 20}, Currency: "USD"}},
 	{"fable", ModelPrice{Tier: Tier{10, 50, 1, 12.5, 20}, Currency: "USD"}},
 
-	// ── Anthropic — generic family fallbacks ───────────────────────────────────
-	{"opus", ModelPrice{Tier: Tier{5, 25, 0.5, 6.25, 10}, Currency: "USD"}},
-	{"sonnet", ModelPrice{Tier: Tier{3, 15, 0.3, 3.75, 6}, Currency: "USD"}},
-	{"haiku", ModelPrice{Tier: Tier{1, 5, 0.1, 1.25, 2}, Currency: "USD"}},
-	{"claude", ModelPrice{Tier: Tier{3, 15, 0.3, 3.75, 6}, Currency: "USD"}},
-
 	// ── OpenAI / codex (no cache-write tier) ───────────────────────────────────
 	// gpt-5.4 / gpt-5.5 carry a long-context premium above 272000 tokens.
 	{"gpt-5.5", ModelPrice{Tier: Tier{5, 30, 0.5, 0, 0}, Currency: "USD",
@@ -62,10 +57,6 @@ var priceTable = []priceEntry{
 	{"codex-mini", ModelPrice{Tier: Tier{1.5, 6, 0.375, 0, 0}, Currency: "USD"}},
 	{"o3", ModelPrice{Tier: Tier{2, 8, 0.5, 0, 0}, Currency: "USD"}},
 	{"o1", ModelPrice{Tier: Tier{15, 60, 7.5, 0, 0}, Currency: "USD"}},
-
-	// OpenAI generic fallbacks.
-	{"codex", ModelPrice{Tier: Tier{1.25, 10, 0.125, 0, 0}, Currency: "USD"}},
-	{"gpt", ModelPrice{Tier: Tier{1.25, 10, 0.125, 0, 0}, Currency: "USD"}},
 
 	// ── Gemini (no cache-write tier) ───────────────────────────────────────────
 	// gemini-2.5-pro / gemini-3-pro carry a long-context premium above 200000 tokens.

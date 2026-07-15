@@ -383,7 +383,7 @@ func (s *ClaudeSource) appendUserTurn(tr *Transcript, line *rawLine, pending map
 					Blocks: []Block{{
 						Type: BlockTool, EventID: p.ToolUseID, ToolUseID: p.ToolUseID,
 						ToolResult: p.resultText(), IsError: p.IsError,
-						ResultSeen: true, Orphan: true,
+						ResultSeen: true, Orphan: true, EndedAt: tsPtr(at),
 					}},
 				})
 				continue
@@ -392,10 +392,11 @@ func (s *ClaudeSource) appendUserTurn(tr *Transcript, line *rawLine, pending map
 			blk.ToolResult = p.resultText()
 			blk.IsError = p.IsError
 			blk.ResultSeen = true // the call actually completed (vs. one cut off by an interrupt)
-			// Agent subflow: derive honest end-to-end duration from the
-			// tool_use→tool_result timestamp delta (the only subagent timing
-			// available from the parent jsonl). Tokens stay 0 (→ "—").
-			if blk.Type == BlockAgent && !loc.useAt.IsZero() && !at.IsZero() {
+			blk.EndedAt = tsPtr(at)
+			// Every Claude tool has an honest tool_use→tool_result interval.
+			// Unmatched calls never execute this branch, so interrupted time is
+			// kept out of completed-latency aggregates by construction.
+			if !loc.useAt.IsZero() && !at.IsZero() {
 				if d := at.Sub(loc.useAt).Milliseconds(); d > 0 {
 					blk.DurationMs = int(d)
 				}
@@ -524,7 +525,7 @@ func (s *ClaudeSource) appendAssistantTurn(tr *Transcript, line *rawLine, pendin
 				turn.Blocks = append(turn.Blocks, Block{Type: BlockThinking, Text: p.Thinking, EventID: eventID})
 			}
 		case "tool_use":
-			blk := Block{ToolName: p.Name, ToolUseID: p.ID, ToolInput: p.Input, EventID: p.ID}
+			blk := Block{ToolName: p.Name, ToolUseID: p.ID, ToolInput: p.Input, EventID: p.ID, StartedAt: tsPtr(at)}
 			if p.Name == "Agent" {
 				// Agent tool_use = subagent dispatch → AgentBlock subflow.
 				blk.Type = BlockAgent

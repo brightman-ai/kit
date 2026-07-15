@@ -89,12 +89,15 @@ func TestCodexSource_SyntheticUsageAndPatchPath(t *testing.T) {
 	if usageBlocks != 1 {
 		t.Fatalf("expected exactly 1 usage block (rate-limit-only token_count must be skipped), got %d", usageBlocks)
 	}
-	if got := intField(gotUsage, "input_tokens"); got != 1200 {
-		t.Errorf("usage input_tokens: want 1200, got %d (usage=%v)", got, gotUsage)
+	if got := intField(gotUsage, "input_tokens"); got != 200 {
+		t.Errorf("usage fresh input_tokens: want 200, got %d (usage=%v)", got, gotUsage)
 	}
-	// output folds reasoning_output_tokens: 80 + 20 = 100
-	if got := intField(gotUsage, "output_tokens"); got != 100 {
-		t.Errorf("usage output_tokens (incl reasoning): want 100, got %d (usage=%v)", got, gotUsage)
+	// output_tokens is already inclusive; thinking_tokens is a non-additive detail.
+	if got := intField(gotUsage, "output_tokens"); got != 80 {
+		t.Errorf("usage inclusive output_tokens: want 80, got %d (usage=%v)", got, gotUsage)
+	}
+	if got := intField(gotUsage, "thinking_tokens"); got != 20 {
+		t.Errorf("usage thinking_tokens breakdown: want 20, got %d (usage=%v)", got, gotUsage)
 	}
 	// codex cached_input_tokens → SSOT key cache_read_input_tokens
 	if got := intField(gotUsage, "cache_read_input_tokens"); got != 1000 {
@@ -105,11 +108,11 @@ func TestCodexSource_SyntheticUsageAndPatchPath(t *testing.T) {
 	}
 
 	// ── Meta totals (footer session sum) ─────────────────────────────────────
-	if got := intField(tr.Meta, "input_tokens"); got != 1200 {
-		t.Errorf("Meta input_tokens: want 1200, got %d", got)
+	if got := intField(tr.Meta, "input_tokens"); got != 200 {
+		t.Errorf("Meta fresh input_tokens: want 200, got %d", got)
 	}
-	if got := intField(tr.Meta, "output_tokens"); got != 100 {
-		t.Errorf("Meta output_tokens: want 100, got %d", got)
+	if got := intField(tr.Meta, "output_tokens"); got != 80 {
+		t.Errorf("Meta output_tokens: want 80, got %d", got)
 	}
 	if got := intField(tr.Meta, "cache_read_tokens"); got != 1000 {
 		t.Errorf("Meta cache_read_tokens: want 1000, got %d", got)

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -450,6 +451,88 @@ func TestQuota_FresherRolloutBeatsStaleProbe(t *testing.T) {
 
 	if q.Snapshot == nil || q.Snapshot.Source != SourceRollout {
 		t.Fatalf("the fresher rollout must win over a 2h-older probe, got %v", q.Snapshot)
+	}
+}
+
+// UB-16: family is part of quota identity. This is the reported production shape: an older
+// premium probe (one 7d window, 96% left) coexists with a newer codex rollout (5h+7d, 83% on
+// the weekly window). The newer family becomes the legacy projection, but must not erase the
+// independently useful premium observation.
+func TestQuota_DifferentFamiliesCoexist_CompatibilityUsesGlobalNewest(t *testing.T) {
+	env := newQuotaEnv(t).withCodexAuth(t, false).withCLI(t, "codex")
+	env.withCodexRollout(t, "pro", time.Now().Add(2*time.Hour))
+
+	probe := fmt.Sprintf(
+		`{"captured_at":%d,"source":"probe","plan_type":"pro","family":"premium","primary":{"used_percent":4,"window_minutes":10080,"resets_at":%d}}`,
+		time.Now().Add(-13*time.Hour).Unix(), time.Now().Add(150*time.Hour).Unix())
+	write(t, filepath.Join(env.deepwork, "codex-rate-limits.json"), probe)
+
+	q := (codexProvider{}).Query()
+	if q.Family != "codex" || q.Snapshot == nil || q.Snapshot.Source != SourceRollout {
+		t.Fatalf("legacy projection must be globally newest codex rollout, got family=%q snapshot=%+v", q.Family, q.Snapshot)
+	}
+	if len(q.QuotaGroups) != 2 {
+		t.Fatalf("want codex + premium groups, got %+v", q.QuotaGroups)
+	}
+	byFamily := make(map[string]QuotaGroup)
+	for _, group := range q.QuotaGroups {
+		byFamily[group.Family] = group
+	}
+	if byFamily["codex"].Snapshot == nil || byFamily["codex"].Snapshot.Stale {
+		t.Fatalf("fresh codex group = %+v", byFamily["codex"])
+	}
+	if byFamily["premium"].Snapshot == nil || !byFamily["premium"].Snapshot.Stale {
+		t.Fatalf("13h-old premium group must remain visible but stale, got %+v", byFamily["premium"])
+	}
+	if got := byFamily["premium"].Windows[0].RemainingPercent; got != 96 {
+		t.Fatalf("premium remaining = %v, want 96", got)
+	}
+}
+
+func TestQuota_SameFamilyKeepsOnlyItsNewestReading(t *testing.T) {
+	env := newQuotaEnv(t).withCodexAuth(t, false).withCLI(t, "codex")
+	env.withCodexRollout(t, "pro", time.Now().Add(2*time.Hour))
+	probe := fmt.Sprintf(
+		`{"captured_at":%d,"source":"probe","plan_type":"pro","family":"codex","primary":{"used_percent":9,"window_minutes":300,"resets_at":%d}}`,
+		time.Now().Unix(), time.Now().Add(3*time.Hour).Unix())
+	write(t, filepath.Join(env.deepwork, "codex-rate-limits.json"), probe)
+
+	q := (codexProvider{}).Query()
+	if len(q.QuotaGroups) != 1 {
+		t.Fatalf("same family must collapse to one group, got %+v", q.QuotaGroups)
+	}
+	if q.QuotaGroups[0].Snapshot == nil || q.QuotaGroups[0].Snapshot.Source != SourceProbe {
+		t.Fatalf("newer probe must win within codex family, got %+v", q.QuotaGroups[0])
+	}
+}
+
+func TestCodexRollout_KeepsNewestObservationPerAccountFamily(t *testing.T) {
+	env := newQuotaEnv(t)
+	dir := filepath.Join(env.codexHome, "sessions", "2026", "07", "14")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	line := func(at time.Time, family string, used float64) string {
+		return fmt.Sprintf(
+			`{"timestamp":%q,"payload":{"rate_limits":{"limit_id":%q,"limit_name":null,"plan_type":"pro","primary":{"used_percent":%v,"window_minutes":10080,"resets_at":%d}}}}`,
+			at.UTC().Format(time.RFC3339), family, used, time.Now().Add(150*time.Hour).Unix())
+	}
+	now := time.Now()
+	write(t, filepath.Join(dir, "rollout-2026-07-14T00-00-00-families.jsonl"), strings.Join([]string{
+		line(now.Add(-30*time.Minute), "premium", 4),
+		line(now.Add(-20*time.Minute), "codex", 17),
+		line(now.Add(-10*time.Minute), "codex", 18),
+	}, "\n"))
+
+	readings := codexRolloutReadings()
+	if len(readings) != 2 {
+		t.Fatalf("want two account families, got %+v", readings)
+	}
+	if readings[0].Family != "codex" || readings[0].Windows[0].UsedPercent != 18 {
+		t.Fatalf("newest codex observation must win within family, got %+v", readings[0])
+	}
+	if readings[1].Family != "premium" || readings[1].Windows[0].UsedPercent != 4 {
+		t.Fatalf("premium must survive newer codex events, got %+v", readings[1])
 	}
 }
 

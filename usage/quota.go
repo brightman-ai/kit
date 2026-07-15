@@ -115,6 +115,15 @@ type RuntimeHealth struct {
 	Version string `json:"version,omitempty"`
 }
 
+// QuotaGroup is one independently-accounted limit family. A runtime can expose several
+// account families at once (for example Codex "premium" and "codex"); each group therefore
+// owns its windows and provenance. They must never be spliced together or replace one another.
+type QuotaGroup struct {
+	Family   string        `json:"family,omitempty"`
+	Windows  []QuotaWindow `json:"windows,omitempty"`
+	Snapshot *SnapshotMeta `json:"snapshot,omitempty"`
+}
+
 // QuotaInfo describes the quota state for one runtime, along the four axes above.
 type QuotaInfo struct {
 	// Runtime is the CLI name: "claude", "codex", "gemini".
@@ -131,15 +140,16 @@ type QuotaInfo struct {
 
 	// ── axis 3: the reading
 	Plan string `json:"plan,omitempty"`
-	// Family names WHICH set of limits these windows belong to. The provider can switch a
-	// codex account between families with different windows ("codex" = 5h+7d, "premium" = one
-	// 7-day window), and when it does, a bar simply disappears. Saying which family is active
-	// is the only way the user can tell "the provider changed my plan's shape" from
-	// "this app broke".
+	// Family names WHICH set of limits these compatibility-projection windows belong to.
+	// Codex can expose independent account families with different window shapes ("codex" =
+	// 5h+7d, "premium" = one 7-day window); QuotaGroups below is the lossless representation.
 	Family  string        `json:"family,omitempty"`
 	Windows []QuotaWindow `json:"windows,omitempty"`
 	// Snapshot is nil when no reading has ever been captured.
 	Snapshot *SnapshotMeta `json:"snapshot,omitempty"`
+	// QuotaGroups is the lossless view: one latest whole reading per family. Family/Windows/
+	// Snapshot above remain the globally-newest compatibility projection for old consumers.
+	QuotaGroups []QuotaGroup `json:"quota_groups,omitempty"`
 
 	// ── axis 4: runtime health
 	Health RuntimeHealth `json:"health"`
@@ -159,16 +169,54 @@ func (info *QuotaInfo) applyReading(r *Reading) {
 	if r == nil {
 		return
 	}
+	group := quotaGroupFromReading(r)
 	info.Plan = r.Plan
-	info.Family = r.Family
+	info.Family = group.Family
 	if r.Billing != "" {
 		info.Billing = r.Billing
 	}
-	// Dedupe FIRST, then stamp — the snapshot's expiry marks land on the windows we are going
-	// to publish. (Marking the reading's own slice instead silently drops the flags whenever
-	// dedupe returns a fresh slice.)
-	info.Windows = dedupeWindows(r.Windows)
-	info.Snapshot = newSnapshotMeta(r, info.Windows)
+	info.Windows = group.Windows
+	info.Snapshot = group.Snapshot
+	info.QuotaGroups = []QuotaGroup{group}
+}
+
+// applyReadings publishes every independent family while retaining the old single-reading
+// fields as a deterministic projection of the globally newest observation.
+func (info *QuotaInfo) applyReadings(readings []*Reading) {
+	if len(readings) == 0 {
+		return
+	}
+	groups := make([]QuotaGroup, 0, len(readings))
+	for _, r := range readings {
+		if r != nil {
+			groups = append(groups, quotaGroupFromReading(r))
+		}
+	}
+	if len(groups) == 0 {
+		return
+	}
+
+	newest := readings[0] // newestReadingsByFamily returns newest-first.
+	info.Plan = newest.Plan
+	info.Family = groups[0].Family
+	if newest.Billing != "" {
+		info.Billing = newest.Billing
+	}
+	info.Windows = groups[0].Windows
+	info.Snapshot = groups[0].Snapshot
+	info.QuotaGroups = groups
+}
+
+func quotaGroupFromReading(r *Reading) QuotaGroup {
+	// Copy before stamping expiry/inference: callers may reuse a Reading in another projection,
+	// and query-time metadata must not mutate the source observation.
+	windows := append([]QuotaWindow(nil), r.Windows...)
+	windows = dedupeWindows(windows)
+	return QuotaGroup{
+		Family:   r.Family,
+		Windows:  windows,
+		Snapshot: newSnapshotMeta(r, windows),
+	}
 }
 
 // dedupeWindows keeps one window per kind. Two windows of the same kind is a contradiction —
@@ -339,13 +387,22 @@ func (codexProvider) CanProbe() bool {
 
 func (codexProvider) Probe(ctx context.Context) error { return probeCodexQuota(ctx) }
 
-// Query assembles codex's four axes from the freshest available reading: the rollout codex
-// writes as it works, or the drop file our probe writes when the user asks.
+// Query assembles codex's four axes from the freshest available reading PER FAMILY: rollout
+// observations codex writes as it works, plus the drop file our probe writes when asked.
 func (codexProvider) Query() QuotaInfo {
 	info := QuotaInfo{Runtime: "codex", Health: probeCLI("codex")}
 
-	reading := newestReading(codexRolloutReading(), codexProbeReading())
-	info.Evidence = codexPresenceEvidence(reading != nil)
+	rolloutReadings := codexRolloutReadings()
+	probeReading := codexProbeReading()
+	// Snapshots written before Family existed cannot form a trustworthy second bucket. Attach
+	// them to the newest observed account family so the upgrade preserves the old age-wins rule.
+	if probeReading != nil && probeReading.Family == "" {
+		if latestRollout := newestReading(rolloutReadings...); latestRollout != nil {
+			probeReading.Family = latestRollout.Family
+		}
+	}
+	readings := newestReadingsByFamily(append(rolloutReadings, probeReading)...)
+	info.Evidence = codexPresenceEvidence(len(readings) > 0)
 	info.Present = len(info.Evidence) > 0
 	if !info.Present {
 		return info
@@ -353,9 +410,9 @@ func (codexProvider) Query() QuotaInfo {
 
 	// Billing is knowable from the auth file's SHAPE (an API key vs an OAuth token set) — we
 	// look at which field is populated, never at its value.
-	info.Billing = codexBilling(reading != nil)
+	info.Billing = codexBilling(len(readings) > 0)
 
-	if reading == nil {
+	if len(readings) == 0 {
 		if info.Billing == BillingAPI {
 			info.Note = "API 计费会话 · 按量付费（无订阅额度窗口）"
 		} else {
@@ -364,8 +421,8 @@ func (codexProvider) Query() QuotaInfo {
 		return info
 	}
 
-	info.applyReading(reading)
-	switch reading.Source {
+	info.applyReadings(readings)
+	switch readings[0].Source {
 	case SourceProbe:
 		info.Note = "账号额度 · 实时查询"
 	default:
