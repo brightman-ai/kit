@@ -50,9 +50,16 @@ type SessionMeta struct {
 	// Empty Activity means the list route did not derive it (no deriver wired) —
 	// the frontend treats absent state as QUIET/idle. These drive the two-axis tab
 	// + tree badge and the OBSERVED「在另一会话中活跃·观测中」banner/composer-lock.
-	Activity  string `json:"activity,omitempty"`
-	Attention string `json:"attention,omitempty"`
-	Owned     bool   `json:"owned,omitempty"`
+	// RuntimeSessionID is the upstream CLI conversation id a deepwork session is
+	// backed by (claude jsonl uuid / codex rollout id), empty when it has none. It
+	// lets a client address the session's OWN runtime transcript — without it, a
+	// deepwork row backed by codex is indistinguishable from one that is not, and
+	// the only readable summary is the single-line turn preview. Never set for
+	// claude/codex rows: there ID already IS the runtime id.
+	RuntimeSessionID string `json:"runtime_session_id,omitempty"`
+	Activity         string `json:"activity,omitempty"`
+	Attention        string `json:"attention,omitempty"`
+	Owned            bool   `json:"owned,omitempty"`
 	// SessionExecution is orthogonal to the root liveness/write-authority axes above.
 	// A quiet root may still have running child AgentExecutions.
 	ExecutionActivity   string `json:"execution_activity,omitempty"` // running | idle
