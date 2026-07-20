@@ -287,6 +287,63 @@ func isCommandEcho(s string) bool {
 		strings.HasPrefix(s, "Caveat:")
 }
 
+var (
+	cmdNameRe = regexp.MustCompile(`(?s)<command-name[^>]*>(.*?)</command-name>`)
+	cmdArgsRe = regexp.MustCompile(`(?s)<command-args[^>]*>(.*?)</command-args>`)
+)
+
+// restoreSlashCommand recovers the human's actual words from a custom
+// slash-command envelope (skill / user command). claude expands what the human
+// typed (`/foo bar baz`) into a <command-message>/<command-name>/<command-args>
+// wrapper on a single user line — the typed words survive only inside
+// <command-args>; the rest is the runtime's own bookkeeping. The three tags'
+// order is not fixed (real jsonl has both name-before-message and
+// message-before-name), so each is located independently rather than by
+// position or a hand-rolled offset.
+//
+// Returns ok=false when there is nothing to recover: an empty <command-args>
+// (e.g. `/compact`, `/clear`, `/model`) is a real command but carries no human
+// text, so it stays dropped like any other tooling echo.
+func restoreSlashCommand(s string) (string, bool) {
+	m := cmdArgsRe.FindStringSubmatch(s)
+	if m == nil {
+		return "", false
+	}
+	args := strings.TrimSpace(m[1])
+	if args == "" {
+		return "", false
+	}
+	m = cmdNameRe.FindStringSubmatch(s)
+	if m == nil {
+		return "", false
+	}
+	name := strings.TrimSpace(m[1])
+	if name == "" {
+		return "", false
+	}
+	if !strings.HasPrefix(name, "/") {
+		name = "/" + name // defensive: real samples always carry the slash already
+	}
+	return name + " " + args, true
+}
+
+// unwrapCommandEcho is the single place every isCommandEcho call site routes
+// through, so a slash command's <command-args> gets recovered exactly once
+// instead of being re-parsed at each of the three read paths (turn count,
+// bubble assembly, bubble accept/reject). Ordinary text passes through
+// untouched; a wrapper with recoverable args becomes "/name args" — a real
+// human turn, previously lost entirely; every other echo shape (empty-args
+// wrapper, local-command-stdout, Caveat) still resolves to "" and is dropped.
+func unwrapCommandEcho(s string) string {
+	if !isCommandEcho(s) {
+		return s
+	}
+	if restored, ok := restoreSlashCommand(s); ok {
+		return restored
+	}
+	return ""
+}
+
 func stringField(m map[string]interface{}, key string) string {
 	if m == nil {
 		return ""

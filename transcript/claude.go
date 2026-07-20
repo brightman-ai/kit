@@ -157,8 +157,8 @@ func (s *ClaudeSource) scanMeta(path, id string) SessionMeta {
 			if line.IsMeta {
 				continue // skip local-command / slash-command meta echoes
 			}
-			txt := line.userText()
-			if txt == "" || isCommandEcho(txt) {
+			txt := unwrapCommandEcho(line.userText())
+			if txt == "" {
 				continue
 			}
 			// The list's turn_count must mean the same thing as the round count the
@@ -411,15 +411,15 @@ func (s *ClaudeSource) appendUserTurn(tr *Transcript, line *rawLine, pending map
 			bubbleText.WriteString(p.Text)
 		}
 	}
-	if s := line.contentString(); s != "" && !isCommandEcho(s) {
+	if s := unwrapCommandEcho(line.contentString()); s != "" {
 		if bubbleText.Len() > 0 {
 			bubbleText.WriteString("\n")
 		}
 		bubbleText.WriteString(s)
 	}
 
-	text := strings.TrimSpace(bubbleText.String())
-	if text == "" || isCommandEcho(text) {
+	text := unwrapCommandEcho(strings.TrimSpace(bubbleText.String()))
+	if text == "" {
 		return
 	}
 
