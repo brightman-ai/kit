@@ -72,6 +72,11 @@ type Tunnel struct {
 	localAddr string    // local addr the running tunnel forwards to
 	cmd       *exec.Cmd // set only for a process WE spawned this run (for reaping); nil when adopted
 
+	// Edge-health (edgehealth.go): the watchdog looks past pid-liveness at real edge reachability.
+	metricsAddr string             // cloudflared --metrics loopback addr for the /ready probe; "" = unprobeable
+	startedAt   time.Time          // when the running cloudflared was (re)started/adopted — anchors the grace window
+	edgeProbe   func(string) bool  // /ready probe; probeEdgeReady in production, overridable in tests
+
 	// Named-tunnel live state (stateMu-guarded). mode is "quick" or "named" while running.
 	mode       string // "quick" | "named" | "" (not running)
 	hostname   string // named-mode target hostname
@@ -116,10 +121,11 @@ type persistedState struct {
 	LogPath   string `json:"logPath,omitempty"`
 
 	// Named-tunnel fields (empty for a quick tunnel).
-	Mode       string `json:"mode,omitempty"`       // "" (quick) | "named"
-	Hostname   string `json:"hostname,omitempty"`   // named-mode hostname
-	TunnelName string `json:"tunnelName,omitempty"` // named-mode cloudflared tunnel name
-	CredFile   string `json:"credFile,omitempty"`   // named-mode credentials JSON path
+	Mode        string `json:"mode,omitempty"`        // "" (quick) | "named"
+	Hostname    string `json:"hostname,omitempty"`    // named-mode hostname
+	TunnelName  string `json:"tunnelName,omitempty"`  // named-mode cloudflared tunnel name
+	CredFile    string `json:"credFile,omitempty"`    // named-mode credentials JSON path
+	MetricsAddr string `json:"metricsAddr,omitempty"` // cloudflared --metrics addr, so an adopting host can /ready-probe it
 }
 
 // New creates a tunnel manager. dataDir is where cloudflared is cached AND where the
@@ -145,6 +151,7 @@ func New(dataDir string) *Tunnel {
 		certPath:   filepath.Join(cfHome, "cert.pem"),
 		loginLog:   filepath.Join(cfHome, "login.log"),
 		globalCert: globalCert,
+		edgeProbe:  probeEdgeReady,
 	}
 	if st, ok := t.loadState(); ok {
 		if pidAlive(st.PID) {
@@ -159,6 +166,8 @@ func New(dataDir string) *Tunnel {
 			t.hostname = st.Hostname
 			t.tunnelName = st.TunnelName
 			t.credFile = st.CredFile
+			t.metricsAddr = st.MetricsAddr // "" for a tunnel spawned before edge-probing → unprobeable
+			t.startedAt = time.Now()       // adoption time anchors grace; harmless for an already-registered tunnel
 			// A tunnel started before intent existed is still the user's declared wish — back-fill it
 			// so an already-deployed tunnel comes under the watchdog without the user re-enabling it.
 			t.adoptIntentFromState(st)
@@ -240,7 +249,7 @@ func (t *Tunnel) Start(ctx context.Context, localAddr string) (string, error) {
 	}
 	if running && !pidAlive(pid) {
 		// adopted/spawned earlier but the daemon has since died → clear before re-spawning.
-		t.setState(false, "", 0, "", nil, "", "")
+		t.setState(false, "", 0, "", nil, "", "", "")
 		t.removeState()
 	}
 
@@ -272,7 +281,11 @@ func (t *Tunnel) Start(ctx context.Context, localAddr string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("create tunnel log: %w", err)
 	}
-	cmd := exec.Command(t.binPath, "tunnel", "--url", localAddr) //nolint:gosec — binPath is ours
+	// --metrics exposes cloudflared's /ready endpoint so the watchdog can see edge reachability, not
+	// just process liveness (edgehealth.go). A "" addr (port reservation failed) simply omits it →
+	// pid-only supervision, no regression.
+	metricsAddr := pickMetricsAddr()
+	cmd := exec.Command(t.binPath, cloudflaredQuickArgs(metricsAddr, localAddr)...) //nolint:gosec — binPath is ours
 	// Same proxy-strip as the named path: cloudflared's only outbound destination is the Cloudflare
 	// edge (7844); an inherited HTTPS_PROXY pointing at a dead/blocking proxy hangs it at "Starting".
 	cmd.Env = append(tunnelChildEnv(), "NO_PROXY=*", "no_proxy=*")
@@ -295,8 +308,8 @@ func (t *Tunnel) Start(ctx context.Context, localAddr string) (string, error) {
 	// Reap the child if it dies while WE are still alive; if the host dies first, init reaps it.
 	go cmd.Wait() //nolint:errcheck
 
-	t.setState(true, url, cmd.Process.Pid, localAddr, cmd, "quick", "")
-	t.saveState(persistedState{PublicURL: url, PID: cmd.Process.Pid, LocalAddr: localAddr, LogPath: t.logPath})
+	t.setState(true, url, cmd.Process.Pid, localAddr, cmd, "quick", "", metricsAddr)
+	t.saveState(persistedState{PublicURL: url, PID: cmd.Process.Pid, LocalAddr: localAddr, LogPath: t.logPath, MetricsAddr: metricsAddr})
 	t.saveIntent(intent{Mode: "quick", LocalAddr: localAddr})
 
 	return url, nil
@@ -307,7 +320,16 @@ func (t *Tunnel) Start(ctx context.Context, localAddr string) (string, error) {
 func (t *Tunnel) Stop() {
 	t.startMu.Lock()
 	defer t.startMu.Unlock()
+	t.teardown()
+	t.removeIntent() // the user turned it off: the watchdog must NOT bring it back
+}
 
+// teardown kills the running cloudflared (spawned this run OR adopted/persisted) and clears live +
+// persisted process state, WITHOUT touching intent. Stop() adds removeIntent() on top; the watchdog's
+// edge-down restart calls teardown() alone — it must first evict the stale (edge-dead but pid-alive)
+// process and clear tunnel.json so the ensuing Start/StartNamed spawns a FRESH connector instead of
+// re-adopting the dead one (the re-adopt trap that let a broken tunnel persist for days).
+func (t *Tunnel) teardown() {
 	t.stateMu.Lock()
 	cmd := t.cmd
 	pid := t.pid
@@ -320,6 +342,8 @@ func (t *Tunnel) Stop() {
 	t.hostname = ""
 	t.tunnelName = ""
 	t.credFile = ""
+	t.metricsAddr = ""
+	t.startedAt = time.Time{}
 	t.stateMu.Unlock()
 
 	// Fall back to the persisted pid if this host process never adopted one in memory.
@@ -333,12 +357,11 @@ func (t *Tunnel) Stop() {
 		cmd.Wait() //nolint:errcheck — reap our own child
 	}
 	t.removeState()
-	t.removeIntent() // the user turned it off: the watchdog must NOT bring it back
 }
 
 // setState atomically updates the live tunnel fields. mode is "quick"/"named" while running,
-// "" when clearing; named credentials are cleared on any not-running transition.
-func (t *Tunnel) setState(running bool, url string, pid int, addr string, cmd *exec.Cmd, mode, hostname string) {
+// "" when clearing; named credentials + edge-health anchors are cleared on any not-running transition.
+func (t *Tunnel) setState(running bool, url string, pid int, addr string, cmd *exec.Cmd, mode, hostname, metricsAddr string) {
 	t.stateMu.Lock()
 	t.running = running
 	t.publicURL = url
@@ -347,7 +370,11 @@ func (t *Tunnel) setState(running bool, url string, pid int, addr string, cmd *e
 	t.cmd = cmd
 	t.mode = mode
 	t.hostname = hostname
-	if !running {
+	t.metricsAddr = metricsAddr
+	if running {
+		t.startedAt = time.Now()
+	} else {
+		t.startedAt = time.Time{}
 		t.tunnelName = ""
 		t.credFile = ""
 	}

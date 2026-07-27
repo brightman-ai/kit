@@ -141,7 +141,8 @@ func (t *Tunnel) supervise(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	fails := 0
+	fails := 0      // consecutive failed RESTARTS → drives the backoff ladder
+	edgeFails := 0  // consecutive not-ready EDGE probes → debounces a transient blip vs a real death
 	var nextAttempt time.Time // zero = attempt as soon as a death is seen
 
 	for {
@@ -153,21 +154,39 @@ func (t *Tunnel) supervise(ctx context.Context, interval time.Duration) {
 
 		in, ok := t.loadIntent()
 		if !ok {
-			fails, nextAttempt = 0, time.Time{} // tunnel off by the user's choice — nothing to heal
+			fails, edgeFails, nextAttempt = 0, 0, time.Time{} // tunnel off by the user's choice — nothing to heal
 			continue
 		}
-		if t.IsRunning() {
+
+		switch t.probeHealth(time.Now()) {
+		case healthOK, healthRegistering:
 			if fails > 0 {
 				t.log("tunnel: recovered (%s → %s)", in.Mode, t.PublicURL())
 			}
-			fails, nextAttempt = 0, time.Time{}
+			fails, edgeFails, nextAttempt = 0, 0, time.Time{}
 			continue
+		case healthEdgeDown:
+			// pid is alive but cloudflared has no edge connection (the Error-1033 shape). Debounce a
+			// transient blip; only a SUSTAINED miss is a real death worth a disruptive restart.
+			edgeFails++
+			if edgeFails < edgeFailThreshold {
+				t.log("tunnel: edge unreachable (%d/%d) — %s pid up but /ready is down",
+					edgeFails, edgeFailThreshold, in.Mode)
+				continue
+			}
+			t.log("tunnel: edge down %d× — tearing down stale cloudflared and re-establishing", edgeFails)
+			edgeFails = 0
+			t.teardown() // evict the edge-dead process so the restart spawns fresh instead of re-adopting it
+			// fall through to restart
+		case healthDead:
+			// process gone — fall through to restart
 		}
+
 		if now := time.Now(); !nextAttempt.IsZero() && now.Before(nextAttempt) {
 			continue // still backing off from the last failed restart
 		}
 
-		t.log("tunnel: cloudflared is gone — restarting (%s %s → %s, attempt %d)",
+		t.log("tunnel: re-establishing (%s %s → %s, attempt %d)",
 			in.Mode, in.Hostname, in.LocalAddr, fails+1)
 
 		var err error

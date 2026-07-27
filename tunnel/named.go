@@ -156,7 +156,7 @@ func (t *Tunnel) StartNamed(ctx context.Context, hostname, localAddr string) (st
 	if running && pidAlive(pid) {
 		killPID(pid)
 	}
-	t.setState(false, "", 0, "", nil, "", "")
+	t.setState(false, "", 0, "", nil, "", "", "")
 
 	if !t.hasAccount() {
 		return "", fmt.Errorf("not logged in to Cloudflare — connect an account first")
@@ -181,9 +181,12 @@ func (t *Tunnel) StartNamed(ctx context.Context, hostname, localAddr string) (st
 	if err != nil {
 		return "", fmt.Errorf("create tunnel log: %w", err)
 	}
+	// --metrics exposes cloudflared's /ready endpoint for the watchdog's edge-reachability probe
+	// (edgehealth.go); "" (port reservation failed) omits it → pid-only supervision, no regression.
+	// NB: --metrics is a `tunnel`-level flag and must precede "run" — see cloudflaredNamedRunArgs.
+	metricsAddr := pickMetricsAddr()
 	// Detached run, forced onto http2. NO_AUTOUPDATE so cloudflared never self-restarts under us.
-	cmd := exec.Command(t.binPath, "tunnel", "run", //nolint:gosec — binPath is ours
-		"--protocol", "http2", "--cred-file", credFile, "--url", localAddr, name)
+	cmd := exec.Command(t.binPath, cloudflaredNamedRunArgs(metricsAddr, credFile, localAddr, name)...) //nolint:gosec — binPath is ours
 	// cloudflared 的出站只有一个目的地: Cloudflare 边缘 (7844)。它**绝不该走 HTTP 代理** ——
 	// 走了会把边缘连接塞进代理, 代理若不放行 7844 / 本身不可达, 就表现为"隧道一直 Starting 卡死"
 	// (实测: 主机 HTTPS_PROXY 指向一个死代理时, cloudflared 直连边缘明明通, 却因继承该变量去走
@@ -208,10 +211,10 @@ func (t *Tunnel) StartNamed(ctx context.Context, hostname, localAddr string) (st
 	go cmd.Wait() //nolint:errcheck — reap if it dies while we live; init reaps if the host dies first
 
 	url = "https://" + hostname
-	t.setNamedRunning(url, cmd.Process.Pid, localAddr, cmd, hostname, name, credFile)
+	t.setNamedRunning(url, cmd.Process.Pid, localAddr, cmd, hostname, name, credFile, metricsAddr)
 	t.saveState(persistedState{
 		PublicURL: url, PID: cmd.Process.Pid, LocalAddr: localAddr, LogPath: t.logPath,
-		Mode: "named", Hostname: hostname, TunnelName: name, CredFile: credFile,
+		Mode: "named", Hostname: hostname, TunnelName: name, CredFile: credFile, MetricsAddr: metricsAddr,
 	})
 	t.saveIntent(intent{Mode: "named", Hostname: hostname, LocalAddr: localAddr})
 	return url, nil
@@ -332,7 +335,7 @@ func (t *Tunnel) setLogin(state, url string) {
 	t.stateMu.Unlock()
 }
 
-func (t *Tunnel) setNamedRunning(url string, pid int, addr string, cmd *exec.Cmd, hostname, name, credFile string) {
+func (t *Tunnel) setNamedRunning(url string, pid int, addr string, cmd *exec.Cmd, hostname, name, credFile, metricsAddr string) {
 	t.stateMu.Lock()
 	t.running = true
 	t.publicURL = url
@@ -343,6 +346,8 @@ func (t *Tunnel) setNamedRunning(url string, pid int, addr string, cmd *exec.Cmd
 	t.hostname = hostname
 	t.tunnelName = name
 	t.credFile = credFile
+	t.metricsAddr = metricsAddr
+	t.startedAt = time.Now()
 	t.stateMu.Unlock()
 }
 
@@ -363,6 +368,8 @@ func (t *Tunnel) adoptPersisted(st persistedState) {
 	t.hostname = st.Hostname
 	t.tunnelName = st.TunnelName
 	t.credFile = st.CredFile
+	t.metricsAddr = st.MetricsAddr // "" for a pre-edge-probe tunnel → unprobeable, pid-only supervision
+	t.startedAt = time.Now()       // adoption time anchors grace
 	t.stateMu.Unlock()
 	t.adoptIntentFromState(st) // adopting a live tunnel = the user wants it up → supervise it
 }
