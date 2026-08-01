@@ -11,10 +11,15 @@ func TestTextEvent_JSON(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Should produce clean JSON without double encoding
-	want := `{"kind":"text","content":"hello"}`
-	if string(data) != want {
-		t.Errorf("JSON:\n got: %s\nwant: %s", data, want)
+	var got map[string]any
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["kind"] != "text" || got["content"] != "hello" {
+		t.Errorf("JSON = %s", data)
+	}
+	if got["at"] == "" {
+		t.Errorf("canonical workstream timestamp missing: %s", data)
 	}
 }
 
@@ -24,9 +29,15 @@ func TestStatusEvent_JSON(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := `{"kind":"status","status":"running"}`
-	if string(data) != want {
-		t.Errorf("JSON:\n got: %s\nwant: %s", data, want)
+	var got map[string]any
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["kind"] != "status" || got["status"] != "running" {
+		t.Errorf("JSON = %s", data)
+	}
+	if got["at"] == "" {
+		t.Errorf("canonical workstream timestamp missing: %s", data)
 	}
 }
 

@@ -1,14 +1,8 @@
 package event
 
-import "sync"
+import "github.com/brightman-ai/kit/workstream"
 
-// SafeEmitter wraps an Emitter with a mutex for concurrent use.
-// Use this when multiple goroutines emit to the same downstream (e.g., Council fan-in).
-func SafeEmitter(emit Emitter) Emitter {
-	var mu sync.Mutex
-	return func(ev Event) bool {
-		mu.Lock()
-		defer mu.Unlock()
-		return emit(ev)
-	}
-}
+// SafeEmitter is kept as a function (rather than a variable alias) so package
+// documentation and call sites remain clear while all behaviour lives in the
+// canonical workstream implementation.
+func SafeEmitter(emit Emitter) Emitter { return workstream.SafeEmitter(emit) }
