@@ -21,6 +21,7 @@ package pricing
 //   - Chinese vendors are priced in CNY, no cache tier, no context tier.
 var priceTable = []priceEntry{
 	// ── Anthropic — Claude Opus (no context tier; cw1h = 2× input) ──────────────
+	{"claude-opus-5", ModelPrice{Tier: Tier{5, 25, 0.5, 6.25, 10}, Currency: "USD"}},
 	{"claude-opus-4-8", ModelPrice{Tier: Tier{5, 25, 0.5, 6.25, 10}, Currency: "USD"}},
 	{"claude-opus-4-7", ModelPrice{Tier: Tier{5, 25, 0.5, 6.25, 10}, Currency: "USD"}},
 	{"claude-opus-4-6", ModelPrice{Tier: Tier{5, 25, 0.5, 6.25, 10}, Currency: "USD"}},

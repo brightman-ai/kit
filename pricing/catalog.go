@@ -169,6 +169,8 @@ func buildCatalogRules() []catalogRule {
 			price: ModelPrice{Tier: Tier{InputPerM: 2, CacheReadPerM: .2, OutputPerM: 10, CacheWrite5mPerM: 2.5, CacheWrite1hPerM: 4}, Currency: "USD"}, sourceURL: claudePricing},
 		{id: "anthropic.claude-sonnet-5.standard.v1", models: []string{"claude-sonnet-5"}, serviceTier: "standard", from: sonnetPromoEnd,
 			price: ModelPrice{Tier: Tier{InputPerM: 3, CacheReadPerM: .3, OutputPerM: 15, CacheWrite5mPerM: 3.75, CacheWrite1hPerM: 6}, Currency: "USD"}, sourceURL: claudePricing},
+		{id: "anthropic.claude-opus-5.standard.v1", models: []string{"claude-opus-5"}, serviceTier: "standard", from: from2026,
+			price: ModelPrice{Tier: Tier{InputPerM: 5, CacheReadPerM: .5, OutputPerM: 25, CacheWrite5mPerM: 6.25, CacheWrite1hPerM: 10}, Currency: "USD"}, sourceURL: claudePricing},
 		{id: "anthropic.claude-opus-4-8.standard.v1", models: []string{"claude-opus-4-8"}, serviceTier: "standard", from: from2026,
 			price: ModelPrice{Tier: Tier{InputPerM: 5, CacheReadPerM: .5, OutputPerM: 25, CacheWrite5mPerM: 6.25, CacheWrite1hPerM: 10}, Currency: "USD"}, sourceURL: claudePricing},
 		{id: "anthropic.claude-fable-mythos-5.standard.v1", models: []string{"claude-fable-5", "claude-mythos-5"}, serviceTier: "standard", from: fable5Launch,

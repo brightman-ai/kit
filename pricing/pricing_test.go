@@ -242,3 +242,22 @@ func TestGeminiContextTier(t *testing.T) {
 		t.Fatalf("gemini-2.5-pro under = %.6f, want base @1.25/M", under)
 	}
 }
+
+// claude-opus-5 曾经完全缺价：UI 如实显示 token 却没有等价金额（Human 实测截图，2026-08-01）。
+// 缺价是刻意的诚实降级（"未加入经核对的规则前，未知模型一律不定价"），所以这不是判定错误，
+// 而是规则还没加。价格取自 LiteLLM 上游快照（本包声明的来源），与 claude-opus-4-8 逐位相同 ——
+// 两者一致本身也是一重旁证。
+func TestClaudeOpus5IsPriced(t *testing.T) {
+	p, ok := Lookup("claude-opus-5")
+	if !ok {
+		t.Fatal("claude-opus-5 无价 —— 它就是 Opus 5，不该落到未知模型那一档")
+	}
+	want := Tier{InputPerM: 5, OutputPerM: 25, CacheReadPerM: .5, CacheWrite5mPerM: 6.25, CacheWrite1hPerM: 10}
+	if p.Tier != want {
+		t.Errorf("claude-opus-5 价 = %+v, want %+v", p.Tier, want)
+	}
+	// 与同档的 opus-4-8 必须一致：哪天其中一个改价而另一个没跟上，这里会红。
+	if q, _ := Lookup("claude-opus-4-8"); q.Tier != p.Tier {
+		t.Errorf("opus-5 与 opus-4-8 定价分叉: %+v vs %+v", p.Tier, q.Tier)
+	}
+}
