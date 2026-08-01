@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -230,7 +231,14 @@ func (s *DeepworkSource) LoadTranscript(ctx context.Context, ref SessionRef) (*T
 	}
 	if s.transcriptDir != "" {
 		path := filepath.Join(s.transcriptDir, "dw-"+ref.ID+".jsonl")
-		if tr, ok := s.loadFromFile(path, ref.ID); ok {
+		tr, ok, fileErr := s.loadFromFile(path, ref.ID)
+		if fileErr != nil {
+			// A present native file is the content SSOT. Corruption or an
+			// unclosed turn must be visible; falling back to a fuller-looking DB
+			// cache would silently replace truth with a projection.
+			return nil, fileErr
+		}
+		if ok {
 			return tr, nil
 		}
 		// fall through to DB when the jsonl is absent/empty (graceful).
@@ -241,49 +249,78 @@ func (s *DeepworkSource) LoadTranscript(ctx context.Context, ref SessionRef) (*T
 // loadFromFile parses the native transcript jsonl into the unified model. ok is
 // false when the file cannot be opened or yields zero turns (→ caller falls back
 // to the DB), so a missing/empty/legacy-stub file never crashes nor blanks out.
-func (s *DeepworkSource) loadFromFile(path, id string) (tr *Transcript, ok bool) {
+func (s *DeepworkSource) loadFromFile(path, id string) (tr *Transcript, ok bool, err error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, false
+		if os.IsNotExist(err) {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("open deepwork transcript %s: %w", id, err)
 	}
 	defer f.Close()
 
 	tr = &Transcript{Source: KindDeepwork, Ref: id, Meta: map[string]interface{}{}}
 	var totalIn, totalOut, totalCacheRead int
 	var sawUsage bool
+	openTurn := false
+	lineNo := 0
 
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 1<<20), 32<<20) // tolerate very long lines
 	for sc.Scan() {
+		lineNo++
 		raw := sc.Bytes()
 		if len(strings.TrimSpace(string(raw))) == 0 {
 			continue
 		}
 		var line NativeEntry
 		if err := json.Unmarshal(raw, &line); err != nil {
-			continue // ignore half-written / corrupt lines (complete-line守卫)
+			return nil, false, fmt.Errorf("deepwork transcript %s line %d is invalid JSON: %w", id, lineNo, err)
 		}
 		switch line.Type {
 		case "user":
+			if line.UserType == "internal" {
+				if !openTurn {
+					return nil, false, fmt.Errorf("deepwork transcript %s contains an internal tool result outside a user turn", id)
+				}
+			} else {
+				if openTurn {
+					return nil, false, fmt.Errorf("deepwork transcript %s starts a new user turn before the previous result", id)
+				}
+				openTurn = true
+			}
 			s.appendUserTurn(tr, &line)
 		case "assistant":
+			if !openTurn {
+				return nil, false, fmt.Errorf("deepwork transcript %s contains an assistant message outside a user turn", id)
+			}
 			s.appendAssistantTurn(tr, &line, &totalIn, &totalOut, &totalCacheRead, &sawUsage)
 		case "result":
+			if !openTurn {
+				return nil, false, fmt.Errorf("deepwork transcript %s contains a result without an open user turn", id)
+			}
 			// The `result` entry carries the turn's wall-clock duration (the assistant
 			// usage inlines only ttft/tokens). Stitch it onto the just-closed assistant
 			// turn's usage block so the replay footer shows 总耗时 — the SAME wall clock
 			// the live Done frame carried (live≡replay). Duration otherwise died with the
 			// skipped result line → replay 总耗时 blank.
 			attachResultDuration(tr, &line)
+			openTurn = false
 		default:
 			// progress / unknown → not a standalone reread block (per-token `progress`
 			// events are the live stream, not reread).
 			continue
 		}
 	}
+	if err := sc.Err(); err != nil {
+		return nil, false, fmt.Errorf("scan deepwork transcript %s: %w", id, err)
+	}
+	if openTurn {
+		return nil, false, fmt.Errorf("deepwork transcript %s ends with an unclosed user turn", id)
+	}
 
 	if len(tr.Turns) == 0 {
-		return nil, false // empty/legacy-stub → let DB fallback try
+		return nil, false, nil // empty/legacy-stub → let DB fallback try
 	}
 	if sawUsage {
 		tr.Meta["input_tokens"] = totalIn
@@ -291,10 +328,12 @@ func (s *DeepworkSource) loadFromFile(path, id string) (tr *Transcript, ok bool)
 		tr.Meta["cache_read_tokens"] = totalCacheRead
 	}
 	tr.Title = firstNonEmpty(transcriptFirstUser(tr), "deepwork session "+shortID(id))
-	return tr, true
+	return tr, true, nil
 }
 
-// appendUserTurn turns a native `user` line into a user_bubble turn.
+// appendUserTurn mirrors Claude's causal vocabulary: an internal user message
+// carries tool results back to the assistant; only an external user message is
+// a human intent.
 func (s *DeepworkSource) appendUserTurn(tr *Transcript, line *NativeEntry) {
 	if line.Message == nil {
 		return
@@ -302,12 +341,19 @@ func (s *DeepworkSource) appendUserTurn(tr *Transcript, line *NativeEntry) {
 	at := nativeEntryTime(line)
 	var sb strings.Builder
 	for _, c := range line.Message.Content {
+		if c.Type == "tool_result" {
+			attachNativeToolResult(tr, &c, at)
+			continue
+		}
 		if c.Type == "text" && strings.TrimSpace(c.Text) != "" {
 			if sb.Len() > 0 {
 				sb.WriteString("\n")
 			}
 			sb.WriteString(c.Text)
 		}
+	}
+	if line.UserType == "internal" {
+		return
 	}
 	text := strings.TrimSpace(sb.String())
 	if text == "" {
@@ -321,6 +367,42 @@ func (s *DeepworkSource) appendUserTurn(tr *Transcript, line *NativeEntry) {
 	})
 }
 
+func attachNativeToolResult(tr *Transcript, result *NativeContentBlock, at time.Time) {
+	for ti := len(tr.Turns) - 1; ti >= 0; ti-- {
+		turn := &tr.Turns[ti]
+		if turn.Role != "assistant" {
+			continue
+		}
+		for bi := len(turn.Blocks) - 1; bi >= 0; bi-- {
+			block := &turn.Blocks[bi]
+			if block.Type != BlockTool || block.ToolUseID != result.ToolUseID {
+				continue
+			}
+			block.ToolResult = nativeContentResultText(result)
+			block.IsError = result.IsError
+			block.ResultSeen = true
+			block.EndedAt = tsPtr(at)
+			if block.StartedAt != nil && !at.IsZero() {
+				if duration := at.Sub(*block.StartedAt).Milliseconds(); duration > 0 {
+					block.DurationMs = int(duration)
+				}
+			}
+			return
+		}
+	}
+
+	// A truncated transcript can contain a result without its call. Preserve it
+	// visibly so diagnostics report the loss instead of silently dropping data.
+	tr.Turns = append(tr.Turns, Turn{
+		Index: len(tr.Turns), Role: "assistant", At: tsPtr(at),
+		Blocks: []Block{{
+			Type: BlockTool, EventID: result.ToolUseID, ToolUseID: result.ToolUseID,
+			ToolName: result.Name, ToolResult: nativeContentResultText(result),
+			IsError: result.IsError, ResultSeen: true, Orphan: true, EndedAt: tsPtr(at),
+		}},
+	})
+}
+
 // appendAssistantTurn parses a native `assistant` line into a turn of typed
 // blocks: thinking → tool (tool_use + attached tool_result) → text → usage,
 // mirroring the writer's block order (AppendAssistant) and claude's reread path.
@@ -330,6 +412,8 @@ func (s *DeepworkSource) appendAssistantTurn(tr *Transcript, line *NativeEntry, 
 	}
 	at := nativeEntryTime(line)
 	turn := Turn{Index: len(tr.Turns), Role: "assistant", At: tsPtr(at)}
+	stopReason := strings.TrimSpace(line.Message.StopReason)
+	yields := stopReason == "" || stopReason == "end_turn" || stopReason == "stop_sequence"
 	// tool_use id → block index so a following tool_result attaches its output.
 	pending := map[string]int{}
 
@@ -347,9 +431,11 @@ func (s *DeepworkSource) appendAssistantTurn(tr *Transcript, line *NativeEntry, 
 		case "tool_use":
 			turn.Blocks = append(turn.Blocks, Block{
 				Type:      BlockTool,
+				EventID:   c.ID,
 				ToolName:  c.Name,
 				ToolUseID: c.ID,
 				ToolInput: nativeContentInputMap(c),
+				StartedAt: tsPtr(at),
 			})
 			if c.ID != "" {
 				pending[c.ID] = len(turn.Blocks) - 1
@@ -375,10 +461,10 @@ func (s *DeepworkSource) appendAssistantTurn(tr *Transcript, line *NativeEntry, 
 		}
 	}
 
-	// A deepwork native assistant entry IS the closed exchange → its text is the answer
-	// (same domain fact claude gets from end_turn and codex from task_complete).
+	// Only the yielding model round owns the answer. A tool_use round is process
+	// trace and remains in the same AgentRun until a later end_turn arrives.
 	for bi := range turn.Blocks {
-		if turn.Blocks[bi].Type == BlockText {
+		if yields && turn.Blocks[bi].Type == BlockText {
 			turn.Blocks[bi].Final = true
 		}
 	}
@@ -404,13 +490,19 @@ func (s *DeepworkSource) appendAssistantTurn(tr *Transcript, line *NativeEntry, 
 	}
 
 	if len(turn.Blocks) == 0 {
+		if yields {
+			for i := len(tr.Turns) - 1; i >= 0; i-- {
+				if tr.Turns[i].Role == "assistant" {
+					tr.Turns[i].Terminal = TerminalEndTurn
+					break
+				}
+			}
+		}
 		return
 	}
-	// deepwork's native transcript writes ONE assistant entry per closed exchange —
-	// the entry itself IS the yield to the human. Stamp the run-boundary fact so the
-	// AgentRun projector treats deepwork exactly like claude/codex (zero provider
-	// branches in the projector).
-	turn.Terminal = TerminalEndTurn
+	if yields {
+		turn.Terminal = TerminalEndTurn
+	}
 	tr.Turns = append(tr.Turns, turn)
 }
 

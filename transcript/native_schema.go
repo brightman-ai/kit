@@ -11,11 +11,9 @@ import "encoding/json"
 // that the two stayed byte-compatible. Both sides now import these exported
 // Native* types instead.
 //
-// Workstream is deliberately json.RawMessage (opaque): this package must not
-// depend on deepwork's workstream event types (kit stays dependency-light and
-// import-cycle free). worktranscript marshals its StreamPayload into this
-// field on write; the reader in this package never decodes `progress` lines
-// into blocks, so it never needs to look inside.
+// Workstream is a legacy, opaque compatibility field. Whale no longer shadows
+// live workstream frames into its transcript; old progress lines remain readable
+// and are ignored by the unified projection.
 //
 // json tags below are byte-identical to the historical write model
 // (pkg/worktranscript.Entry et al.) — do not change them without a wire
@@ -115,8 +113,8 @@ type NativeContentBlock struct {
 // NativeUsage is the inlined per-turn token accounting (v1.1). Pointer fields
 // keep the "nil = unknown vs 0 = observed" distinction the writer honors.
 type NativeUsage struct {
-	InputTokens       *int `json:"input_tokens,omitempty"`
-	OutputTokens      *int `json:"output_tokens,omitempty"`
+	InputTokens  *int `json:"input_tokens,omitempty"`
+	OutputTokens *int `json:"output_tokens,omitempty"`
 	// ThinkingTokens — reasoning token 单列 (CHG-016). Inlined on the assistant
 	// line so the deepwork replay footer shows the SAME thinking token the live
 	// stream did (nil = unknown → 「—」, distinct from the thinking duration).

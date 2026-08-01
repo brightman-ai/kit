@@ -40,6 +40,7 @@ func scanDeepworkMeta(path, id string) (meta SessionMeta, ok bool) {
 	var firstUser string
 	var firstTS, lastTS time.Time
 	userTurns := 0
+	openTurn := false
 
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 1<<20), 32<<20) // tolerate very long lines
@@ -50,7 +51,7 @@ func scanDeepworkMeta(path, id string) (meta SessionMeta, ok bool) {
 		}
 		var line NativeEntry
 		if err := json.Unmarshal(raw, &line); err != nil {
-			continue // ignore half-written / corrupt lines (complete-line 守卫)
+			return SessionMeta{}, false
 		}
 		if ts := nativeEntryTime(&line); !ts.IsZero() {
 			if firstTS.IsZero() {
@@ -58,14 +59,39 @@ func scanDeepworkMeta(path, id string) (meta SessionMeta, ok bool) {
 			}
 			lastTS = ts
 		}
-		if line.Type == "user" && line.Message != nil {
-			if txt := firstText(line.Message.Content); txt != "" {
-				userTurns++
-				if firstUser == "" {
-					firstUser = txt
+		switch line.Type {
+		case "user":
+			if line.UserType == "internal" {
+				if !openTurn {
+					return SessionMeta{}, false
+				}
+			} else {
+				if openTurn {
+					return SessionMeta{}, false
+				}
+				openTurn = true
+				if line.Message != nil {
+					if txt := firstText(line.Message.Content); txt != "" {
+						userTurns++
+						if firstUser == "" {
+							firstUser = txt
+						}
+					}
 				}
 			}
+		case "assistant":
+			if !openTurn {
+				return SessionMeta{}, false
+			}
+		case "result":
+			if !openTurn {
+				return SessionMeta{}, false
+			}
+			openTurn = false
 		}
+	}
+	if sc.Err() != nil || openTurn {
+		return SessionMeta{}, false
 	}
 
 	meta.Title = firstNonEmpty(truncate(firstUser, 80), "deepwork session "+shortID(id))

@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -108,6 +109,60 @@ func TestDeepworkLoadTranscript_FromFile(t *testing.T) {
 	// usage totals surfaced on Meta (workArea reconstruction source).
 	if got := tr.Meta["input_tokens"]; got != 120 {
 		t.Fatalf("meta input_tokens want 120, got %v", got)
+	}
+}
+
+func TestDeepworkLoadTranscriptRejectsPartialFileInsteadOfFallingBackToDB(t *testing.T) {
+	dir := t.TempDir()
+	path := writeDWFile(t, dir, "779", "complete first turn")
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, writeErr := f.WriteString(`{"format":"deepwork.native_transcript.v1.2","runtime":"whale-agent","type":"user","userType":"external","sessionId":"dw-779","message":{"role":"user","content":[{"type":"text","text":"unclosed"}]}}` + "\n")
+	closeErr := f.Close()
+	if writeErr != nil || closeErr != nil {
+		t.Fatalf("append partial turn: write=%v close=%v", writeErr, closeErr)
+	}
+
+	// A complete DB projection exists, but it must never outrank a present SSOT
+	// file. The caller gets an explicit integrity error instead of truncated history.
+	provider := &fakeProvider{turns: []DeepworkTurn{{UserInput: "db", AIOutput: "looks complete"}}}
+	src := NewDeepworkSourceWithDir(provider, 1, dir)
+	if _, err := src.LoadTranscript(t.Context(), SessionRef{ID: "779"}); err == nil || !strings.Contains(err.Error(), "unclosed") {
+		t.Fatalf("partial SSOT must fail visibly, got %v", err)
+	}
+}
+
+func TestDeepworkLoadTranscript_ClaudeShapedToolLoopIsOneAgentRun(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "dw-778.jsonl")
+	lines := "" +
+		`{"format":"deepwork.native_transcript.v1.2","runtime":"whale-agent","type":"user","userType":"external","sessionId":"dw-778","timestamp":"2026-06-17T01:00:00Z","message":{"role":"user","content":[{"type":"text","text":"inspect"}]}}` + "\n" +
+		`{"format":"deepwork.native_transcript.v1.2","runtime":"whale-agent","type":"assistant","sessionId":"dw-778","timestamp":"2026-06-17T01:00:01Z","message":{"role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","id":"tool-1","name":"read","input":{"path":"a"}}]}}` + "\n" +
+		`{"format":"deepwork.native_transcript.v1.2","runtime":"whale-agent","type":"user","userType":"internal","sessionId":"dw-778","timestamp":"2026-06-17T01:00:02Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-1","content":[{"type":"text","text":"body"}]}]}}` + "\n" +
+		`{"format":"deepwork.native_transcript.v1.2","runtime":"whale-agent","type":"assistant","sessionId":"dw-778","timestamp":"2026-06-17T01:00:03Z","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"done"}]}}` + "\n" +
+		`{"format":"deepwork.native_transcript.v1.2","runtime":"whale-agent","type":"result","sessionId":"dw-778","timestamp":"2026-06-17T01:00:04Z","subtype":"success"}` + "\n"
+	if err := os.WriteFile(path, []byte(lines), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	src := NewDeepworkSourceWithDir(nil, 1, dir)
+	tr, err := src.LoadTranscript(context.Background(), SessionRef{ID: "778"})
+	if err != nil {
+		t.Fatalf("LoadTranscript: %v", err)
+	}
+	if len(tr.Turns) != 3 {
+		t.Fatalf("turns=%d, want external user + two assistant rounds", len(tr.Turns))
+	}
+	tool := tr.Turns[1].Blocks[0]
+	if tool.ToolUseID != "tool-1" || tool.ToolResult != "body" || !tool.ResultSeen {
+		t.Fatalf("tool result not attached: %+v", tool)
+	}
+	runs := ProjectAgentRuns(tr)
+	if len(runs) != 1 || runs[0].Status != RunCompleted || len(runs[0].FinalAnswer) != 1 ||
+		runs[0].FinalAnswer[0].Text != "done" {
+		t.Fatalf("runs=%+v", runs)
 	}
 }
 

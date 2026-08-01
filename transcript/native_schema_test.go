@@ -57,10 +57,18 @@ func TestNativeSchemaRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal user NativeEntry: %v", err)
 	}
+	resultLine, err := json.Marshal(NativeEntry{
+		Format: "deepwork.native_transcript.v1.1", Type: "result",
+		SessionID: "dw-900", Timestamp: "2026-06-17T01:00:06Z", Subtype: "success",
+	})
+	if err != nil {
+		t.Fatalf("marshal result NativeEntry: %v", err)
+	}
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, "dw-900.jsonl")
 	content := append(append(userLine, '\n'), append(assistantLine, '\n')...)
+	content = append(content, append(resultLine, '\n')...)
 	if err := os.WriteFile(path, content, 0o644); err != nil {
 		t.Fatalf("write transcript: %v", err)
 	}
