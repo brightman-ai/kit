@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	event "github.com/brightman-ai/kit/llm/event"
+	event "github.com/brightman-ai/kit/workstream"
 )
 
 // NewClaudeDecoder returns a stateful decoder for Claude Code

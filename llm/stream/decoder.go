@@ -5,7 +5,7 @@ package stream
 import (
 	"time"
 
-	event "github.com/brightman-ai/kit/llm/event"
+	event "github.com/brightman-ai/kit/workstream"
 )
 
 // Decoder converts provider-specific stream frames into unified LLM events.

@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	event "github.com/brightman-ai/kit/llm/event"
+	event "github.com/brightman-ai/kit/workstream"
 )
 
 func TestClaudeDecoderPartialToolCallEmitsOnceAtBlockStop(t *testing.T) {
