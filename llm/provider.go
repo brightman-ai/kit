@@ -60,14 +60,21 @@ func VisionUserMessage(text string, imageURLs []string) Message {
 	return Message{Role: "user", Content: parts}
 }
 
-// ToolCall represents a tool call from the model.
+// ToolCallFunction is the function payload shared by complete calls and
+// streaming deltas.
+type ToolCallFunction struct {
+	Name      string `json:"name,omitempty"`
+	Arguments string `json:"arguments,omitempty"`
+}
+
+// ToolCall represents a complete tool call from the model. Index is transport
+// ordering metadata: assemblers preserve it for parallel calls, while ordinary
+// non-streaming responses omit the zero value on the wire.
 type ToolCall struct {
-	ID       string `json:"id"`
-	Type     string `json:"type"`
-	Function struct {
-		Name      string `json:"name"`
-		Arguments string `json:"arguments"`
-	} `json:"function"`
+	Index    int              `json:"index,omitempty"`
+	ID       string           `json:"id"`
+	Type     string           `json:"type"`
+	Function ToolCallFunction `json:"function"`
 }
 
 // Response represents a chat completion response.
@@ -103,13 +110,10 @@ type StreamChunk struct {
 
 // ToolCallDelta represents incremental tool call data in streaming (GLM-5 specific)
 type ToolCallDelta struct {
-	Index    int    `json:"index"`
-	ID       string `json:"id,omitempty"`
-	Type     string `json:"type,omitempty"`
-	Function struct {
-		Name      string `json:"name,omitempty"`
-		Arguments string `json:"arguments,omitempty"` // 累积拼接
-	} `json:"function,omitempty"`
+	Index    int              `json:"index"`
+	ID       string           `json:"id,omitempty"`
+	Type     string           `json:"type,omitempty"`
+	Function ToolCallFunction `json:"function,omitempty"`
 }
 
 // Tool represents a tool definition for function calling.
