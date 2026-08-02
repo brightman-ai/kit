@@ -19,7 +19,7 @@ import (
 func TestNativeSchemaRoundTrip(t *testing.T) {
 	in, out, cacheRead := 120, 42, 10
 	assistant := NativeEntry{
-		Format:    "deepwork.native_transcript.v1.1",
+		Format:    "deepwork.native_transcript.v1.3",
 		Type:      "assistant",
 		SessionID: "dw-900",
 		Timestamp: "2026-06-17T01:00:05Z",
@@ -37,11 +37,30 @@ func TestNativeSchemaRoundTrip(t *testing.T) {
 				OutputTokens:    &out,
 				CacheReadTokens: &cacheRead,
 			},
+			Invocation: &NativeInvocationIdentity{
+				RuntimeID: "whale-agent", ProviderAccountID: "account-a", ProviderKey: "deepseek",
+				RequestedModel: "deepseek-v4-pro", ResolvedModel: "deepseek-v4-pro",
+				ResolvedSource: "provider_response", CatalogRevision: "catalog-r7", ConfigRevision: "config-r7",
+			},
+			AuxiliaryInvocations: []NativeInvocationAttempt{{
+				Purpose: "vision_assist", Status: "success", Output: "a whale",
+				Invocation: NativeInvocationIdentity{RuntimeID: "whale-agent", ProviderAccountID: "account-a", RequestedModel: "vision-model"},
+			}},
+			Status: "success",
 		},
 	}
 	assistantLine, err := json.Marshal(assistant)
 	if err != nil {
 		t.Fatalf("marshal NativeEntry: %v", err)
+	}
+	var wireCopy NativeEntry
+	if err := json.Unmarshal(assistantLine, &wireCopy); err != nil {
+		t.Fatalf("unmarshal NativeEntry: %v", err)
+	}
+	if wireCopy.Message == nil || wireCopy.Message.Invocation == nil ||
+		wireCopy.Message.Invocation.ConfigRevision != "config-r7" ||
+		len(wireCopy.Message.AuxiliaryInvocations) != 1 {
+		t.Fatalf("invocation facts did not round-trip: %#v", wireCopy.Message)
 	}
 
 	userLine, err := json.Marshal(NativeEntry{

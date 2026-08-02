@@ -3,7 +3,7 @@ package transcript
 import "encoding/json"
 
 // native_schema.go is the SINGLE SSOT for the Deepwork Native Transcript JSONL
-// wire schema (deepwork.native_transcript.v1 / v1.1). Before this file the
+// wire schema (deepwork.native_transcript.v1 through v1.3). Before this file the
 // shape was declared TWICE — once as an unexported READ view here
 // (deepwork_raw.go's former dwLine/dwMessage/dwContentBlock/dwUsage/dwMetrics)
 // and once as the WRITE model in a host's worktranscript package
@@ -93,6 +93,37 @@ type NativeMessage struct {
 	// mirroring claude's `message.usage`. nil = path reported no usage (honest
 	// unknown, never fabricated). Self-sufficient: deleting the DB does not lose it.
 	Usage *NativeUsage `json:"usage,omitempty"`
+
+	// Invocation freezes the executable identity for this model attempt. Requested
+	// and provider-reported models remain distinct, and config/catalog revisions
+	// make the fact self-sufficient after the host DB is lost.
+	Invocation *NativeInvocationIdentity `json:"invocation,omitempty"`
+	// AuxiliaryInvocations are hidden preparatory calls (for example vision
+	// description) owned by this main attempt. They are durable facts but are not
+	// projected as extra assistant messages by transcript readers.
+	AuxiliaryInvocations []NativeInvocationAttempt `json:"auxiliary_invocations,omitempty"`
+	Status               string                    `json:"status,omitempty"`
+	Error                string                    `json:"error,omitempty"`
+}
+
+type NativeInvocationIdentity struct {
+	RuntimeID         string `json:"runtime_id,omitempty"`
+	ProviderAccountID string `json:"provider_account_id,omitempty"`
+	ProviderKey       string `json:"provider_key,omitempty"`
+	RequestedModel    string `json:"requested_model,omitempty"`
+	ResolvedModel     string `json:"resolved_model,omitempty"`
+	ResolvedSource    string `json:"resolved_source,omitempty"`
+	CatalogRevision   string `json:"catalog_revision,omitempty"`
+	ConfigRevision    string `json:"config_revision,omitempty"`
+}
+
+type NativeInvocationAttempt struct {
+	Purpose    string                   `json:"purpose,omitempty"`
+	Output     string                   `json:"output,omitempty"`
+	Status     string                   `json:"status,omitempty"`
+	Error      string                   `json:"error,omitempty"`
+	Usage      *NativeUsage             `json:"usage,omitempty"`
+	Invocation NativeInvocationIdentity `json:"invocation"`
 }
 
 // NativeContentBlock is one typed content unit. text/thinking carry their
