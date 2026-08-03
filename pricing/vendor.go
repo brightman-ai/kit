@@ -62,10 +62,31 @@ var (
 	VendorDeepSeek  = Vendor{ID: "deepseek", Display: "DeepSeek"}
 	VendorZhipu     = Vendor{ID: "zhipu", Display: "智谱 GLM"}
 	VendorAlibaba   = Vendor{ID: "alibaba", Display: "通义千问"}
+	VendorXAI       = Vendor{ID: "xai", Display: "xAI"}
+	VendorMistral   = Vendor{ID: "mistral", Display: "Mistral"}
+	VendorMiniMax   = Vendor{ID: "minimax", Display: "MiniMax"}
 	// VendorUnknown is the honest answer, not a fallback bucket. It never absorbs a model into a
 	// neighbouring vendor's row, because a wrong vendor is a wrong currency is a wrong number.
 	VendorUnknown = Vendor{}
 )
+
+// vendorsByID resolves a canonical vendor id to its Vendor. It is what makes the generated
+// table's vendor column meaningful — and its ABSENCE is a real answer: an id here with no entry
+// means upstream started carrying a vendor this codebase has never named, which
+// TestGeneratedVendorsAreCanonical turns into a failed build rather than a row labelled with a
+// raw provider slug.
+var vendorsByID = map[string]Vendor{
+	VendorAnthropic.ID: VendorAnthropic,
+	VendorOpenAI.ID:    VendorOpenAI,
+	VendorGoogle.ID:    VendorGoogle,
+	VendorMoonshot.ID:  VendorMoonshot,
+	VendorDeepSeek.ID:  VendorDeepSeek,
+	VendorZhipu.ID:     VendorZhipu,
+	VendorAlibaba.ID:   VendorAlibaba,
+	VendorXAI.ID:       VendorXAI,
+	VendorMistral.ID:   VendorMistral,
+	VendorMiniMax.ID:   VendorMiniMax,
+}
 
 type vendorEntry struct {
 	key    string
@@ -104,6 +125,14 @@ var vendorTable = []vendorEntry{
 	{"deepseek", VendorDeepSeek},
 	{"glm", VendorZhipu},
 	{"qwen", VendorAlibaba},
+
+	// Reachable because a first-party CLI can be pointed at any OpenAI-compatible endpoint — the
+	// same door kimi and deepseek came through. Only the family stems are listed: the exact ids
+	// upstream carries resolve through table_gen.go, which states the vendor rather than inferring
+	// it from spelling.
+	{"grok", VendorXAI},
+	{"mistral", VendorMistral},
+	{"minimax", VendorMiniMax},
 }
 
 // sortedVendorTable is vendorTable ordered longest-key-first, mirroring buildSortedTable, so a
@@ -130,6 +159,15 @@ func VendorForModel(model string) Vendor {
 	m := normalize(model)
 	if m == "" {
 		return VendorUnknown
+	}
+	// Upstream states the provider for every id it carries, and a stated fact outranks a rule that
+	// infers ownership from how the id is spelled. It has to: "chatgpt-4o-latest" and "o4-mini" are
+	// OpenAI's, and no prefix rule over those strings says so without also claiming every future
+	// model that happens to start the same way.
+	if e, ok := generatedByModel[m]; ok {
+		if v, known := vendorsByID[e.vendor]; known {
+			return v
+		}
 	}
 	for _, e := range sortedVendorTable {
 		if m == e.key || strings.HasPrefix(m, e.key+"-") {

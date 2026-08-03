@@ -4,12 +4,26 @@
 // This package is the single source of truth for LLM model pricing across
 // deepwork-terminal and deepwork-pro. Both consume it as peers; neither owns it.
 //
-// The embedded priceTable (table.go) is a hand-curated SNAPSHOT of LiteLLM's
-// model_prices_and_context_window.json — the same dataset ccusage uses. It carries
-// no network code by design: pricing must be deterministic, offline, and reviewable
-// in a diff. To update prices, edit table.go directly with the new LiteLLM values
-// (USD per million tokens) and re-run the tests, which pin the ccusage-verified
-// anchors.
+// Prices come from three layers, and which layer answered is itself a fact the
+// caller can see (RequestQuote.VerifiedAt / GeneratedSnapshot):
+//
+//	catalog.go    — effective-dated, service-tier-aware rules a human read from the
+//	                vendor's own page. The ONLY layer the per-request report path
+//	                uses, and the only one carrying credits and priority tiers.
+//	table.go      — hand-curated table. Anthropic's split cache-write TTLs, the
+//	                long-context premium tiers and the CNY vendors live only here.
+//	table_gen.go  — generated from LiteLLM's model_prices_and_context_window.json,
+//	                the same dataset ccusage uses. Breadth: ~289 exact model ids.
+//
+// The package itself still carries NO network code — pricing must be deterministic,
+// offline and reviewable in a diff. The fetch lives in a separate main package that
+// a human runs, and what lands in the repo is a .go file reviewed like any other:
+//
+//	go generate ./pricing/...
+//
+// To correct a single price, edit table.go or catalog.go — both outrank the
+// generated table on an exact id, and the tests pin the ccusage-verified anchors.
+// Lookup order and the reason for it are documented on lookupLegacy.
 //
 // Cost is computed PER REQUEST, with two refinements over a flat table:
 //
@@ -20,11 +34,9 @@
 //     context exceeds ModelPrice.ContextThreshold (OpenAI gpt-5.4/5.5: 272000;
 //     Gemini 2.5-pro / 3-pro: 200000). Anthropic 4.x has no context tier.
 //
-// Future (OPTIONAL, not implemented now): a `go:generate` directive could fetch the
-// upstream LiteLLM JSON and regenerate table.go, and a `Refresh`-style API could
-// hot-reload from a cached file. Both are deferred — the snapshot is sufficient and
-// keeps the package free of network dependencies. Do not add network code here
-// without an explicit decision to take on that complexity.
+// Still deliberately NOT here: a Refresh-style API that hot-reloads prices at
+// runtime. A price that can change without a diff cannot be audited after the fact,
+// and every number this package produces is meant to be explainable months later.
 //
-//	//go:generate go run ./internal/gen-table  // future: regenerate from LiteLLM JSON
+//go:generate go run ./internal/gen-table -out table_gen.go
 package pricing

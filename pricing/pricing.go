@@ -190,17 +190,61 @@ func LookupAt(model string, at time.Time, serviceTier string) (ModelPrice, bool)
 	return lookupLegacy(model)
 }
 
+// lookupLegacy resolves a model id against the two embedded tables.
+//
+// The order is EXACT-BEFORE-FAMILY, across both tables, and that is the load-bearing
+// part — not which table is consulted first:
+//
+//	① exact, hand      — curated, and the only place split cache-write TTLs, the
+//	                     long-context premium and CNY vendors exist.
+//	② exact, generated — upstream breadth (see table_gen.go).
+//	③ family, hand     — the deliberate generic fallbacks ("gemini", "glm", "qwen").
+//
+// Running the hand table to exhaustion first — family rules included — would let a
+// generic key outrank an exact one: "gemini-4-pro" would take the "gemini" fallback
+// rate rather than its own published price, and would do it silently. A family rule
+// is a last resort by construction, so it must be consulted last in fact too.
+//
+// Nothing here is a fallback for an UNKNOWN id. Both tables miss ⟹ unpriced.
 func lookupLegacy(model string) (ModelPrice, bool) {
 	m := normalize(model)
 	if m == "" {
 		return ModelPrice{}, false
 	}
 	for _, e := range sortedTable {
-		if m == e.key || strings.HasPrefix(m, e.key+"-") {
+		if m == e.key {
+			return e.price, true
+		}
+	}
+	if e, ok := generatedByModel[m]; ok {
+		return e.price, true
+	}
+	for _, e := range sortedTable {
+		if strings.HasPrefix(m, e.key+"-") {
 			return e.price, true
 		}
 	}
 	return ModelPrice{}, false
+}
+
+// genEntry is one row of the generated upstream snapshot: an exact model id, the
+// vendor upstream says publishes it, and its rate card. See internal/gen-table.
+type genEntry struct {
+	key    string
+	vendor string
+	price  ModelPrice
+}
+
+// generatedByModel indexes table_gen.go by exact id. Built once at init; the
+// generated table is matched by exact id ONLY, so a map is the whole lookup.
+var generatedByModel = buildGeneratedIndex()
+
+func buildGeneratedIndex() map[string]genEntry {
+	index := make(map[string]genEntry, len(generatedTable))
+	for _, e := range generatedTable {
+		index[e.key] = e
+	}
+	return index
 }
 
 // Cost returns the USD (or CNY) cost of ONE request u for model.

@@ -54,6 +54,29 @@ func TestEveryPricedModelHasAVendor(t *testing.T) {
 			t.Errorf("priceTable key %q has a price but no vendor — add it to vendorTable", e.key)
 		}
 	}
+	// The generated table is the reason this invariant earns its keep. table.go grows by hand, so
+	// a missing vendor is caught by whoever types the price; table_gen.go grows by REFRESH, and a
+	// vendor upstream started carrying arrives with nobody looking. Checking it here turns the
+	// generator into a tripwire on vendorTable: the refresh that first pulls in a new vendor fails
+	// the build and names the model, instead of shipping its money into the unknown bucket.
+	for _, e := range generatedTable {
+		if v := VendorForModel(e.key); !v.Known() {
+			t.Errorf("generatedTable key %q has a price but no vendor — add it to vendorTable "+
+				"(or drop its provider from firstPartyProviders in internal/gen-table)", e.key)
+		}
+	}
+}
+
+// A refresh pulls whatever upstream now carries, including vendors added since the last one. Those
+// arrive with nobody looking, so the check has to be mechanical: every vendor id in the generated
+// table must be one this codebase has actually named. Failing here costs one line in vendorsByID;
+// not failing here ships a money row headed by a raw upstream slug.
+func TestGeneratedVendorsAreCanonical(t *testing.T) {
+	for _, e := range generatedTable {
+		if _, known := vendorsByID[e.vendor]; !known {
+			t.Errorf("generatedTable %q carries vendor id %q, which is not in vendorsByID", e.key, e.vendor)
+		}
+	}
 	for _, rule := range buildCatalogRules() {
 		for _, model := range rule.models {
 			if v := VendorForModel(model); !v.Known() {
@@ -81,6 +104,12 @@ func TestOneCurrencyPerVendor(t *testing.T) {
 	}
 	for _, e := range priceTable {
 		record("priceTable", e.key, e.price.Currency)
+	}
+	// Upstream quotes USD throughout, so this is where a CNY hand entry and a USD generated one
+	// would collide inside one vendor — the reason gen-table's allowlist excludes dashscope while
+	// table.go prices qwen in CNY.
+	for _, e := range generatedTable {
+		record("generatedTable", e.key, e.price.Currency)
 	}
 	for _, rule := range buildCatalogRules() {
 		for _, model := range rule.models {
