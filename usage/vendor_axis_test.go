@@ -208,6 +208,46 @@ func TestRequestReport_PricedRowPublishesItsPriceAge(t *testing.T) {
 	}
 }
 
+// Request pricing reaches the generated table, not just the hand-written catalog.
+//
+// This is the half of the two-hop design that is easy to build and forget to connect: gen-table can
+// pull 289 exact ids and every one of them still renders「—」if ProjectRequestCost stops at a
+// catalog miss. o4-mini is a real, thoroughly public model that no human entered into catalog.go.
+func TestRequestReport_PricesModelsOnlyTheGeneratedTableKnows(t *testing.T) {
+	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	rep := BuildRequestReport(Window7d, "UTC", now, []transcript.ModelRequestUsage{
+		factAt("a", "codex", "o4-mini", "api", now.Add(-time.Hour), 1_000_000, 100_000),
+	})
+	row := rowFor(t, rep, "openai", "codex")
+	if row == nil {
+		t.Fatalf("no openai row; got %+v", rep.Providers)
+	}
+	if row.PricedRequests != 1 || row.Cost == nil {
+		t.Fatalf("o4-mini went unpriced: priced=%d cost=%v — the generated table is not wired into request pricing",
+			row.PricedRequests, row.Cost)
+	}
+	if row.PriceVerifiedAt == "" {
+		t.Error("a generated price shipped without stating its age")
+	}
+}
+
+// ...and reaching it must not turn on family guessing. An unknown gemini model can be priced by
+// Lookup's "gemini" fallback, which is the right answer for an estimate and the wrong one for a
+// row the user reads as money owed.
+func TestRequestReport_StillRefusesToGuessUnknownModels(t *testing.T) {
+	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	rep := BuildRequestReport(Window7d, "UTC", now, []transcript.ModelRequestUsage{
+		factAt("a", "gemini", "gemini-9-ultra", "api", now.Add(-time.Hour), 1_000_000, 0),
+	})
+	row := rowFor(t, rep, "google", "gemini")
+	if row == nil {
+		t.Fatalf("no google row; got %+v", rep.Providers)
+	}
+	if row.PricedRequests != 0 || row.Cost != nil {
+		t.Errorf("an unpublished model was priced off a family fallback: priced=%d cost=%v", row.PricedRequests, row.Cost)
+	}
+}
+
 // I6 — money in different currencies is never collapsed into one number.
 //
 // Tested on the collapse itself rather than through a fixture, because every vendor the request

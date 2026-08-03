@@ -125,6 +125,58 @@ func (c Catalog) Quote(q RequestQuery) (RequestQuote, bool) {
 	return RequestQuote{}, false
 }
 
+// QuoteFromSnapshot prices a model from the embedded TABLES when no effective-dated rule covers
+// it — the second and last hop of request pricing.
+//
+// It exists because the catalog and the tables are good at different things. The catalog knows
+// when a price CHANGED and what a service tier costs, which is why it is asked first; it will only
+// ever hold models a human sat down and entered. The tables know breadth — 289 ids straight from
+// upstream. Without this hop that breadth was unreachable from the report: ProjectRequestCost
+// stopped at a catalog miss, so a perfectly well-known model like o4-mini rendered 「—」 and read
+// as a broken panel.
+//
+// Two restrictions keep the breadth from turning into guessing:
+//
+//   - EXACT ids only. lookupLegacy's third hop deliberately lets "gemini" answer for an unknown
+//     gemini model; that is the right answer for a caller asking "roughly what does this cost",
+//     and the wrong one for a caller building a bill. A model nobody has priced must stay unpriced
+//     and say so, which is the whole reason the report shows coverage counts.
+//   - STANDARD tier only. A priority request charged at the standard rate does not fail, it
+//     under-reports — and an under-report is indistinguishable from a real number.
+//
+// Provenance is reported honestly rather than borrowed: a curated entry carries the hand snapshot's
+// date, a generated one carries upstream's, and neither pretends to be an effective-dated rule
+// (EffectiveFrom stays zero, because these prices state no start date).
+func QuoteFromSnapshot(model, serviceTier string) (RequestQuote, bool) {
+	if normalizeServiceTier(serviceTier) != "standard" {
+		return RequestQuote{}, false
+	}
+	m := normalize(model)
+	if m == "" {
+		return RequestQuote{}, false
+	}
+	for _, e := range sortedTable {
+		if m == e.key {
+			return snapshotQuote("curated."+e.key+".standard", e.price, "", catalogSnapshotDate), true
+		}
+	}
+	if e, ok := generatedByModel[m]; ok {
+		return snapshotQuote("litellm."+e.key+".standard", e.price, GeneratedSource, generatedSnapshotDate), true
+	}
+	return RequestQuote{}, false
+}
+
+// generatedSnapshotDate parses the generated table's own stamp once. A malformed stamp is a
+// generator bug, and panicking at init beats shipping quotes that claim no age at all.
+var generatedSnapshotDate = mustDate(GeneratedSnapshot)
+
+func snapshotQuote(ruleID string, price ModelPrice, sourceURL string, verifiedAt time.Time) RequestQuote {
+	return RequestQuote{
+		RuleID: ruleID, CatalogVersion: CatalogVersion, SourceURL: sourceURL,
+		VerifiedAt: verifiedAt, Price: price,
+	}
+}
+
 // FastCreditMultiplier returns a multiplier only for an explicit Fast mode and
 // a model with an official published multiplier. service_tier=priority is not
 // Fast evidence and must never call this function with speed="fast" implicitly.
