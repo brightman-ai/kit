@@ -160,8 +160,10 @@ func TestBuildReport_MergesCodexProviderRowWithCost(t *testing.T) {
 	if codexRow == nil {
 		t.Fatalf("expected a codex ProviderRow (runtime=codex), providers=%+v", rep.Providers)
 	}
-	if codexRow.Provider != "OpenAI" {
-		t.Errorf("codex row Provider = %q, want OpenAI", codexRow.Provider)
+	// The CALLER is codex and the VENDOR is OpenAI — two facts, two fields. They agree here
+	// because this fixture runs gpt-5.4; they would not if it ran k3, which is the point.
+	if codexRow.Vendor != "openai" || codexRow.VendorDisplay != "OpenAI" {
+		t.Errorf("codex row vendor = %q/%q, want openai/OpenAI", codexRow.Vendor, codexRow.VendorDisplay)
 	}
 	wantTotal := wantIn + wantOut + wantCacheRead
 	if codexRow.TotalTokens != wantTotal {

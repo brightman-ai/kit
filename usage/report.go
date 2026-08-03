@@ -2,8 +2,9 @@ package usage
 
 import (
 	"sort"
-	"strings"
 	"time"
+
+	"github.com/brightman-ai/kit/pricing"
 )
 
 // WindowKind names a reporting window.
@@ -57,13 +58,33 @@ type ReportSummary struct {
 	CostComplete bool `json:"cost_complete"`
 }
 
-// ProviderRow is one provider/runtime cost-breakdown row (settings 报表 §Gap-3).
-// Derived from per-model aggregation: each model id is mapped to a provider class
-// + a runtime kind via simple model-name heuristics (claude/codex/gemini/...).
+// ProviderRow is one (vendor, caller, billing) slice of a window's usage.
+//
+// It carries the two money questions on SEPARATE axes, because they have different answers:
+//
+//	Vendor  — WHO IS OWED. Derived from the model id (see pricing.VendorForModel).
+//	Runtime — WHO SPENT IT. The CLI that made the request.
+//
+// They used to be one field named `Provider` holding runtimeDisplay(runtime), so a codex pane
+// talking to DeepSeek produced a row labelled "OpenAI" that the UI then filed under an OpenAI
+// subscription. That field is gone rather than redefined: a repurposed field breaks readers
+// silently, and silence was the original bug.
+//
+// The grain is deliberately fine. One vendor can be reached by several callers, one caller can
+// reach several vendors, and one pair can span an auth switch mid-window — so a window legitimately
+// holds several rows per vendor. Roll-ups are the caller's business; splitting a total is
+// impossible, summing rows is not.
 type ProviderRow struct {
-	// Provider is the display key (e.g. "Claude" / "OpenAI" / "Gemini").
-	Provider string `json:"provider"`
-	// Runtime is the canonical runtime kind ("claude"|"codex"|"gemini"|"other").
+	// Vendor is the canonical billing subject id ("anthropic"|"openai"|"google"|"moonshot"|
+	// "deepseek"|…). EMPTY means the model id named no vendor we know — an honest gap, never a
+	// bucket to sweep strays into.
+	Vendor string `json:"vendor"`
+	// VendorDisplay is that vendor's name as it appears on a human's invoice ("Kimi", not
+	// "Moonshot AI"). Empty exactly when Vendor is: naming the unknown is the surface's job,
+	// since the surface also shows the raw model id beside it.
+	VendorDisplay string `json:"vendor_display,omitempty"`
+	// Runtime is the canonical caller kind ("claude"|"codex"|"gemini"|"other"). Data-driven, not
+	// an enum: a new agent that produces facts shows up here without a code change.
 	Runtime string `json:"runtime"`
 	// BillingMode is request-time evidence (subscription|api|unknown). A runtime
 	// may therefore produce multiple rows in one window after an auth switch.
@@ -77,9 +98,19 @@ type ProviderRow struct {
 	Cost              *float64           `json:"cost"`
 	Currency          string             `json:"currency,omitempty"`
 	Costs             map[string]float64 `json:"costs,omitempty"`
-	// TopModel is the highest-token model id under this provider (主要消耗).
+	// Requests / PricedRequests make this row's own completeness checkable without consulting the
+	// window summary. A row whose priced count is short says so — «≈» on this row — instead of
+	// inheriting an approximation from some unrelated model in another tab.
+	Requests       int `json:"requests"`
+	PricedRequests int `json:"priced_requests"`
+	// PriceVerifiedAt (YYYY-MM-DD) is the OLDEST price-rule verification date behind this row's
+	// money — its staleness BOUND, not its best case. Empty when nothing here was priced.
+	PriceVerifiedAt string `json:"price_verified_at,omitempty"`
+	// TopModel is the highest-token model id under this row (主要消耗). For an unknown vendor this
+	// is the only handle the user has on what they were actually running, so it is never omitted
+	// there.
 	TopModel string `json:"top_model,omitempty"`
-	// Spark is the per-day total-token trend for this provider (oldest-first).
+	// Spark is the per-day total-token trend for this row (oldest-first).
 	Spark []int64 `json:"spark"`
 }
 
@@ -251,27 +282,22 @@ func BuildReport(window WindowKind, src TokenSource) UsageReport {
 	}
 }
 
-// providerForModel maps a model id onto a (display, runtime) provider key for the
-// per-provider cost breakdown. Mirrors fleet_routes.runtimeFromModel heuristics.
-func providerForModel(model string) (display, runtime string) {
-	m := strings.ToLower(model)
-	switch {
-	case strings.Contains(m, "claude") || strings.Contains(m, "sonnet") ||
-		strings.Contains(m, "opus") || strings.Contains(m, "haiku") || strings.Contains(m, "fable"):
-		return "Claude", "claude"
-	case strings.Contains(m, "gpt") || strings.Contains(m, "codex") ||
-		strings.Contains(m, "o1") || strings.Contains(m, "o3"):
-		return "OpenAI", "codex"
-	case strings.Contains(m, "gemini"):
-		return "Gemini", "gemini"
-	case strings.Contains(m, "glm"):
-		return "GLM", "other"
-	case strings.Contains(m, "deepseek"):
-		return "DeepSeek", "other"
-	case strings.Contains(m, "qwen"):
-		return "Qwen", "other"
+// runtimeGuessForVendor infers WHICH CLI probably made a request from WHOSE model answered it.
+//
+// It is a guess and named as one. It exists for exactly one caller: the legacy token-source report,
+// which reconstructs usage from per-model token bundles and has no runtime evidence at all. Every
+// path that HAS the evidence (a transcript says which CLI wrote it) must use that instead — the
+// inverse direction is not sound, since any CLI can now call any vendor.
+func runtimeGuessForVendor(v pricing.Vendor) string {
+	switch v.ID {
+	case pricing.VendorAnthropic.ID:
+		return "claude"
+	case pricing.VendorOpenAI.ID:
+		return "codex"
+	case pricing.VendorGoogle.ID:
+		return "gemini"
 	default:
-		return "其他", "other"
+		return "other"
 	}
 }
 
@@ -288,13 +314,14 @@ func buildFromModelBundles(window WindowKind, now time.Time, days int, startDate
 	dayMap := make(map[string]*dayAcc, days)
 
 	type provAcc struct {
-		display, runtime string
-		in, out, cr, cc  int64
-		cost             float64
-		hasCost          bool
-		currency         string
-		byModel          map[string]int64 // model → total tokens (主要消耗)
-		byDay            map[string]int64 // date → total tokens (spark)
+		vendor          pricing.Vendor
+		runtime         string
+		in, out, cr, cc int64
+		cost            float64
+		hasCost         bool
+		currency        string
+		byModel         map[string]int64 // model → total tokens (主要消耗)
+		byDay           map[string]int64 // date → total tokens (spark)
 	}
 	provMap := make(map[string]*provAcc)
 
@@ -327,11 +354,11 @@ func buildFromModelBundles(window WindowKind, now time.Time, days int, startDate
 		summary.CacheCreateTokens += b.CacheCreateTokens
 		summary.TotalTokens += total
 
-		display, runtime := providerForModel(b.Model)
-		pa := provMap[display]
+		vendor := pricing.VendorForModel(b.Model)
+		pa := provMap[vendor.ID]
 		if pa == nil {
-			pa = &provAcc{display: display, runtime: runtime, byModel: map[string]int64{}, byDay: map[string]int64{}}
-			provMap[display] = pa
+			pa = &provAcc{vendor: vendor, runtime: runtimeGuessForVendor(vendor), byModel: map[string]int64{}, byDay: map[string]int64{}}
+			provMap[vendor.ID] = pa
 		}
 		pa.in += b.InputTokens
 		pa.out += b.OutputTokens
@@ -399,7 +426,8 @@ func buildFromModelBundles(window WindowKind, now time.Time, days int, startDate
 			continue
 		}
 		pr := ProviderRow{
-			Provider:          pa.display,
+			Vendor:            pa.vendor.ID,
+			VendorDisplay:     pa.vendor.Display,
 			Runtime:           pa.runtime,
 			InputTokens:       pa.in,
 			OutputTokens:      pa.out,

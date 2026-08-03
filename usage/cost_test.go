@@ -90,22 +90,24 @@ func TestBuildReport_CostAndProviders(t *testing.T) {
 	if *rep.Summary.Cost != 31.25 {
 		t.Fatalf("window cost = %v, want 31.25", *rep.Summary.Cost)
 	}
-	// Providers: Claude, OpenAI, 其他 (3 distinct).
+	// Providers: anthropic, openai, and the unknown vendor (3 distinct).
 	if len(rep.Providers) != 3 {
 		t.Fatalf("providers = %d, want 3", len(rep.Providers))
 	}
-	// Claude should top (2M tokens) and carry a cost; 其他 (unknown) has nil cost.
-	if rep.Providers[0].Provider != "Claude" || rep.Providers[0].Cost == nil {
-		t.Fatalf("top provider = %+v, want Claude with cost", rep.Providers[0])
+	// Anthropic should top (2M tokens) and carry a cost.
+	if rep.Providers[0].Vendor != "anthropic" || rep.Providers[0].Cost == nil {
+		t.Fatalf("top provider = %+v, want anthropic with cost", rep.Providers[0])
 	}
+	// The unpriced model gets an EMPTY vendor and a nil cost — it must not be folded into a
+	// neighbouring vendor just to avoid an ugly row.
 	var other *ProviderRow
 	for i := range rep.Providers {
-		if rep.Providers[i].Provider == "其他" {
+		if rep.Providers[i].Vendor == "" {
 			other = &rep.Providers[i]
 		}
 	}
 	if other == nil || other.Cost != nil {
-		t.Fatalf("其他 provider should exist with nil cost (unpriced), got %+v", other)
+		t.Fatalf("unknown-vendor provider should exist with nil cost (unpriced), got %+v", other)
 	}
 	// Per-day rows carry cache_create field (zero here) + correct count.
 	if len(rep.Rows) != 7 {

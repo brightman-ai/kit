@@ -5,15 +5,27 @@ import (
 	"strings"
 	"time"
 
+	"github.com/brightman-ai/kit/pricing"
 	"github.com/brightman-ai/kit/transcript"
 )
 
 type requestReportAcc struct {
+	// Identity of a provider bucket. Held as fields rather than re-parsed out of the map key:
+	// the vendor id may legitimately be EMPTY (unknown vendor), and a key-splitting scheme that
+	// has to survive an empty component is a bug waiting for its first unknown model.
+	vendor  pricing.Vendor
+	runtime string
+	billing string
+
 	in, out, read, write int64
 	costs                map[string]float64
 	priced, requests     int
 	byModel              map[string]int64
 	byDay                map[string]int64
+	// priceVerifiedAt is the OLDEST verification date among this bucket's priced requests — a
+	// staleness BOUND. Newest would flatter: one freshly-checked model would make a row full of
+	// half-year-old prices look current.
+	priceVerifiedAt time.Time
 }
 
 // BuildRequestReport is the compatibility report rebuilt from request-grain
@@ -39,13 +51,18 @@ func BuildRequestReport(window WindowKind, timezone string, now time.Time, facts
 			continue
 		}
 		date := fact.At.In(loc).Format("2006-01-02")
+		// The two money axes, resolved independently from the evidence each one actually has.
+		// Vendor from the model id (pricing.VendorForModel documents why not from fact.Provider);
+		// caller from the transcript that recorded the fact. Only when the transcript names no
+		// caller at all does the vendor get to suggest one, and that is flagged as a guess.
+		vendor := pricing.VendorForModel(fact.Model)
 		runtime := fact.Runtime
 		if runtime == "" {
-			_, runtime = providerForModel(fact.Model)
+			runtime = runtimeGuessForVendor(vendor)
 		}
 		day := ensureRequestAcc(daysAcc, date)
 		billing := normalizeRequestBilling(fact.BillingMode)
-		rt := ensureRequestAcc(runtimes, runtime+"\x00"+billing)
+		rt := ensureProviderAcc(runtimes, vendor, runtime, billing)
 		physicalInput := fact.InputTokens
 		cacheWrite := fact.CacheWrite5mTokens + fact.CacheWrite1hTokens + fact.CacheWriteUnknownTokens
 		physicalTotal := physicalInput + fact.CachedInputTokens + cacheWrite + fact.OutputTokens
@@ -72,6 +89,10 @@ func BuildRequestReport(window WindowKind, timezone string, now time.Time, facts
 				}
 				target.costs[projection.Currency] += *projection.APIEquivalent
 				target.priced++
+				if !projection.PriceVerifiedAt.IsZero() &&
+					(target.priceVerifiedAt.IsZero() || projection.PriceVerifiedAt.Before(target.priceVerifiedAt)) {
+					target.priceVerifiedAt = projection.PriceVerifiedAt
+				}
 			}
 		}
 	}
@@ -97,23 +118,48 @@ func BuildRequestReport(window WindowKind, timezone string, now time.Time, facts
 	}
 	summary.Cost, summary.Currency = scalarCost(summary.Costs)
 	providers := make([]ProviderRow, 0, len(runtimes))
-	for runtimeBilling, a := range runtimes {
-		runtime, billing, _ := strings.Cut(runtimeBilling, "\x00")
-		display := runtimeDisplay(runtime)
+	for _, a := range runtimes {
+		// A zero-token bucket is not usage. claude writes `model:"<synthetic>"` placeholder rows
+		// into every transcript; on a live machine they arrive as ~10 requests carrying nothing at
+		// all. Rendering them costs a line that says「未知厂商 · 0 tok · —」— three unknowns and no
+		// fact — and invites the reader to go investigate nothing. The legacy report path has
+		// skipped these since it was written; this one was quietly showing them.
+		//
+		// Safe for the "rows sum to the summary" invariant precisely because the sum they
+		// contribute is zero.
+		if a.in+a.out+a.read+a.write == 0 {
+			continue
+		}
 		row := ProviderRow{
-			Provider: display, Runtime: runtime, BillingMode: billing, BillingCoverage: billingCoverage(billing), InputTokens: a.in, OutputTokens: a.out,
+			Vendor: a.vendor.ID, VendorDisplay: a.vendor.Display,
+			Runtime: a.runtime, BillingMode: a.billing, BillingCoverage: billingCoverage(a.billing),
+			InputTokens: a.in, OutputTokens: a.out,
 			CacheReadTokens: a.read, CacheCreateTokens: a.write,
 			TotalTokens: a.in + a.out + a.read + a.write, TopModel: topKey(a.byModel),
+			Requests: a.requests, PricedRequests: a.priced,
 			Spark: requestDaySpark(start, days, a.byDay), Costs: roundedCosts(a.costs),
+		}
+		if !a.priceVerifiedAt.IsZero() {
+			row.PriceVerifiedAt = a.priceVerifiedAt.Format("2006-01-02")
 		}
 		row.Cost, row.Currency = scalarCost(row.Costs)
 		providers = append(providers, row)
 	}
+	// Biggest spend first, then a total order over the identity so the list is stable across
+	// refreshes. Map iteration is random, and a table that reshuffles under a stationary cursor is
+	// a table you cannot read.
 	sort.Slice(providers, func(i, j int) bool {
-		if providers[i].Runtime == providers[j].Runtime {
-			return providers[i].BillingMode < providers[j].BillingMode
+		l, r := providers[i], providers[j]
+		if l.TotalTokens != r.TotalTokens {
+			return l.TotalTokens > r.TotalTokens
 		}
-		return providers[i].TotalTokens > providers[j].TotalTokens
+		if l.Vendor != r.Vendor {
+			return l.Vendor < r.Vendor
+		}
+		if l.Runtime != r.Runtime {
+			return l.Runtime < r.Runtime
+		}
+		return l.BillingMode < r.BillingMode
 	})
 	return UsageReport{
 		Window: window, StartDate: start.Format("2006-01-02"), EndDate: endExclusive.Add(-time.Nanosecond).Format("2006-01-02"),
@@ -161,6 +207,25 @@ func ensureRequestAcc(values map[string]*requestReportAcc, key string) *requestR
 	return value
 }
 
+// ensureProviderAcc buckets by the FULL identity (vendor, caller, billing).
+//
+// All three belong in the key. Dropping vendor is the bug being repaid — it merged a DeepSeek
+// request into a codex row that then read as OpenAI. Dropping billing would merge the two halves
+// of a mid-window auth switch, and dropping the caller would lose the "who spent it" sub-rows the
+// UI shows under each vendor. Splitting later is impossible; summing later is trivial.
+func ensureProviderAcc(values map[string]*requestReportAcc, vendor pricing.Vendor, runtime, billing string) *requestReportAcc {
+	key := vendor.ID + "\x00" + runtime + "\x00" + billing
+	if value := values[key]; value != nil {
+		return value
+	}
+	value := &requestReportAcc{
+		vendor: vendor, runtime: runtime, billing: billing,
+		costs: make(map[string]float64),
+	}
+	values[key] = value
+	return value
+}
+
 func roundedCosts(costs map[string]float64) map[string]float64 {
 	if len(costs) == 0 {
 		return nil
@@ -181,19 +246,6 @@ func scalarCost(costs map[string]float64) (*float64, string) {
 		return &value, currency
 	}
 	return nil, ""
-}
-
-func runtimeDisplay(runtime string) string {
-	switch runtime {
-	case "claude":
-		return "Claude"
-	case "codex":
-		return "OpenAI"
-	case "gemini":
-		return "Gemini"
-	default:
-		return "其他"
-	}
 }
 
 func requestDaySpark(start time.Time, days int, values map[string]int64) []int64 {

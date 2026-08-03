@@ -1,6 +1,8 @@
 package usage
 
 import (
+	"time"
+
 	"github.com/brightman-ai/kit/pricing"
 	"github.com/brightman-ai/kit/transcript"
 )
@@ -18,8 +20,13 @@ type RequestCostProjection struct {
 	Credits        *float64 `json:"credits,omitempty"`
 	FastMultiplier *float64 `json:"fast_multiplier,omitempty"`
 	FastSourceURL  string   `json:"fast_source_url,omitempty"`
-	Complete       bool     `json:"complete"`
-	Diagnostics    []string `json:"diagnostics,omitempty"`
+	// PriceVerifiedAt is when the rule behind this number was last checked against
+	// SourceURL. Carried through so a report can publish the AGE of its own prices:
+	// an embedded table cannot detect a vendor's price change, so saying how old it
+	// is, is the only defence the reader gets.
+	PriceVerifiedAt time.Time `json:"price_verified_at,omitempty"`
+	Complete        bool      `json:"complete"`
+	Diagnostics     []string  `json:"diagnostics,omitempty"`
 }
 
 // ProjectRequestCost prices exactly one request. Unknown cache-write TTL is a
@@ -56,6 +63,7 @@ func ProjectRequestCost(f transcript.ModelRequestUsage) RequestCostProjection {
 	result.RuleID = quote.RuleID
 	result.CatalogVersion = quote.CatalogVersion
 	result.SourceURL = quote.SourceURL
+	result.PriceVerifiedAt = quote.VerifiedAt
 	result.APIEquivalent = &amount
 	result.Currency = currency
 	if credits, known := quote.Credits(u); known {
