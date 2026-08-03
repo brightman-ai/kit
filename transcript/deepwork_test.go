@@ -34,6 +34,64 @@ func writeDWFile(t *testing.T, dir, id, userText string) string {
 	return path
 }
 
+func TestDeepworkLifecycleInvocationDoesNotChangeTurnState(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "dw-77.jsonl")
+	lines := []string{
+		`{"format":"deepwork.native_transcript.v1.4","type":"user","sessionId":"dw-77","timestamp":"2026-08-03T01:00:00Z","message":{"role":"user","content":[{"type":"text","text":"first"}]}}`,
+		`{"format":"deepwork.native_transcript.v1.4","type":"assistant","sessionId":"dw-77","timestamp":"2026-08-03T01:00:01Z","message":{"role":"assistant","content":[{"type":"text","text":"one"}],"usage":{"input_tokens":10,"output_tokens":2}}}`,
+		`{"format":"deepwork.native_transcript.v1.4","type":"result","sessionId":"dw-77","timestamp":"2026-08-03T01:00:02Z"}`,
+		`{"format":"deepwork.native_transcript.v1.4","type":"user","sessionId":"dw-77","timestamp":"2026-08-03T01:00:03Z","message":{"role":"user","content":[{"type":"text","text":"second"}]}}`,
+		`{"format":"deepwork.native_transcript.v1.4","type":"invocation","sessionId":"dw-77","deepworkTurnId":1,"timestamp":"2026-08-03T01:00:04Z","attempt":{"id":"inv-title","purpose":"auto_title","status":"success","usage":{"input_tokens":3,"output_tokens":1},"invocation":{"runtime_id":"whale-agent","resolved_model":"deepseek-chat"}}}`,
+		`{"format":"deepwork.native_transcript.v1.4","type":"assistant","sessionId":"dw-77","timestamp":"2026-08-03T01:00:05Z","message":{"role":"assistant","content":[{"type":"text","text":"two"}]}}`,
+		`{"format":"deepwork.native_transcript.v1.4","type":"result","sessionId":"dw-77","timestamp":"2026-08-03T01:00:06Z"}`,
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	src := NewDeepworkSourceWithDir(nil, 1, dir)
+	tr, err := src.LoadTranscript(context.Background(), SessionRef{ID: "77"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tr.Turns) != 4 {
+		t.Fatalf("turns=%d, invocation must not add/close a turn: %+v", len(tr.Turns), tr.Turns)
+	}
+	if tr.Meta["input_tokens"] != 13 || tr.Meta["output_tokens"] != 3 {
+		t.Fatalf("aggregate usage must include lifecycle exactly once: %+v", tr.Meta)
+	}
+	invocations, ok := tr.Meta["invocations"].([]map[string]interface{})
+	if !ok || len(invocations) != 1 || invocations[0]["turn_id"] != int64(1) {
+		t.Fatalf("lifecycle attribution=%#v", tr.Meta["invocations"])
+	}
+}
+
+func TestDeepworkEmbeddedAuxiliaryIncludedExactlyOnceInMetaAndTotals(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "dw-78.jsonl")
+	attempt := `{"id":"inv-vision","purpose":"vision_assist","status":"success","duration_ms":20,"usage":{"input_tokens":8,"output_tokens":2},"invocation":{"runtime_id":"whale-agent","resolved_model":"deepseek-vl"}}`
+	lines := []string{
+		`{"format":"deepwork.native_transcript.v1.4","type":"user","sessionId":"dw-78","deepworkTurnId":1,"timestamp":"2026-08-03T01:00:00Z","message":{"role":"user","content":[{"type":"text","text":"image"}]}}`,
+		`{"format":"deepwork.native_transcript.v1.4","type":"assistant","sessionId":"dw-78","deepworkTurnId":1,"timestamp":"2026-08-03T01:00:01Z","message":{"role":"assistant","content":[{"type":"text","text":"answer"}],"auxiliary_invocations":[` + attempt + `]}}`,
+		`{"format":"deepwork.native_transcript.v1.4","type":"invocation","sessionId":"dw-78","deepworkTurnId":1,"timestamp":"2026-08-03T01:00:02Z","attempt":` + attempt + `}`,
+		`{"format":"deepwork.native_transcript.v1.4","type":"result","sessionId":"dw-78","deepworkTurnId":1,"timestamp":"2026-08-03T01:00:03Z"}`,
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tr, err := NewDeepworkSourceWithDir(nil, 1, dir).LoadTranscript(context.Background(), SessionRef{ID: "78"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tr.Meta["input_tokens"] != 8 || tr.Meta["output_tokens"] != 2 {
+		t.Fatalf("embedded+standalone auxiliary double-count/loss: %+v", tr.Meta)
+	}
+	invocations, ok := tr.Meta["invocations"].([]map[string]interface{})
+	if !ok || len(invocations) != 1 || invocations[0]["id"] != "inv-vision" {
+		t.Fatalf("invocations=%#v", tr.Meta["invocations"])
+	}
+}
+
 // TestDeepworkListSessions_DirectoryAsIndex is the P3 核心: with NO DB provider
 // (simulating a deleted/empty DB), ListSessions must still enumerate every
 // dw-<id>.jsonl from the transcript directory (目录即索引).

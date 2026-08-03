@@ -3,6 +3,7 @@ package transcript
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -357,5 +358,105 @@ func TestCodexUsageMap_DoesNotDoubleCachedOrReasoning(t *testing.T) {
 	}
 	if got := intField(u, "thinking_tokens"); got != 40 {
 		t.Fatalf("reasoning=%d", got)
+	}
+}
+
+func TestScanDeepworkRequestUsageCountsMainAndLifecycleOnce(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "dw-7.jsonl")
+	data := "" +
+		`{"format":"deepwork.native_transcript.v1.4","runtime":"whale-agent","type":"assistant","sessionId":"dw-7","deepworkTurnId":3,"timestamp":"2026-08-03T01:00:00Z","requestId":"req-main","message":{"id":"msg-main","role":"assistant","model":"requested-fallback","content":[],"usage":{"input_tokens":100,"output_tokens":20,"thinking_tokens":5,"cache_read_tokens":10,"cache_creation_tokens":2},"invocation":{"runtime_id":"whale-agent","provider_key":"deepseek","requested_model":"deepseek-chat","resolved_model":"deepseek-v4"}}}` + "\n" +
+		`{"format":"deepwork.native_transcript.v1.4","runtime":"whale-agent","type":"invocation","sessionId":"dw-7","deepworkTurnId":3,"timestamp":"2026-08-03T01:00:02Z","requestId":"inv-title","attempt":{"id":"inv-title","purpose":"auto_title","status":"success","duration_ms":500,"usage":{"input_tokens":30,"output_tokens":4},"invocation":{"runtime_id":"whale-agent","provider_key":"deepseek","requested_model":"deepseek-chat","resolved_model":"deepseek-chat"}}}` + "\n" +
+		`{"format":"deepwork.native_transcript.v1.4","runtime":"whale-agent","type":"invocation","sessionId":"dw-7","deepworkTurnId":3,"timestamp":"2026-08-03T01:00:02Z","requestId":"inv-title","attempt":{"id":"inv-title","purpose":"auto_title","status":"success","duration_ms":500,"usage":{"input_tokens":30,"output_tokens":4},"invocation":{"runtime_id":"whale-agent","provider_key":"deepseek","requested_model":"deepseek-chat","resolved_model":"deepseek-chat"}}}` + "\n"
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	facts, err := ScanDeepworkRequestUsage(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(facts) != 2 {
+		t.Fatalf("facts=%d, want main+lifecycle exactly once: %+v", len(facts), facts)
+	}
+	if facts[0].Model != "deepseek-v4" || facts[0].RawInputTokens != 100 || facts[0].InputTokens != 88 || facts[0].PhysicalTotalTokens() != 120 || facts[0].ReasoningOutputTokens != 5 {
+		t.Fatalf("main fact=%+v", facts[0])
+	}
+	if facts[1].InputTokens != 30 || facts[1].OutputTokens != 4 || facts[1].StartedAt == nil {
+		t.Fatalf("lifecycle fact=%+v", facts[1])
+	}
+}
+
+func TestScanDeepworkRequestUsageCountsAuxiliaryWhenPrimaryUsageMissing(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dw-9.jsonl")
+	data := `{"format":"deepwork.native_transcript.v1.4","runtime":"whale-agent","type":"assistant","sessionId":"dw-9","deepworkTurnId":4,"timestamp":"2026-08-03T01:00:00Z","requestId":"req-main","message":{"id":"msg-main","role":"assistant","content":[],"auxiliary_invocations":[{"id":"inv-vision","purpose":"vision_assist","status":"success","usage":{"input_tokens":50,"output_tokens":3,"cache_read_tokens":20},"invocation":{"runtime_id":"whale-agent","provider_key":"deepseek","resolved_model":"deepseek-vl"}}]}}` + "\n"
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	facts, err := ScanDeepworkRequestUsage(path)
+	if err != nil || len(facts) != 2 {
+		t.Fatalf("facts=%+v err=%v", facts, err)
+	}
+	if facts[0].ID != "deepwork:dw-9:req-main" || facts[0].Coverage.Tokens != CoverageMissing {
+		t.Fatalf("usage-less primary fact=%+v", facts[0])
+	}
+	if facts[1].ID != "deepwork:dw-9:inv-vision" || facts[1].InputTokens != 30 || facts[1].CachedInputTokens != 20 || facts[1].PhysicalTotalTokens() != 53 {
+		t.Fatalf("auxiliary fact=%+v", facts[1])
+	}
+}
+
+func TestScanDeepworkRequestUsageIncrementalLeavesPartialTail(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "dw-8.jsonl")
+	first := `{"type":"invocation","sessionId":"dw-8","timestamp":"2026-08-03T01:00:00Z","attempt":{"id":"inv-1","purpose":"auto_title","usage":{"input_tokens":1},"invocation":{}}}` + "\n"
+	if err := os.WriteFile(path, []byte(first), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	facts, cursor, err := ScanDeepworkRequestUsageIncremental(path, DeepworkRequestCursor{})
+	if err != nil || len(facts) != 1 {
+		t.Fatalf("first facts=%+v cursor=%+v err=%v", facts, cursor, err)
+	}
+	partial := `{"type":"invocation","sessionId":"dw-8","timestamp":"2026-08-03T01:00:01Z","attempt":{"id":"inv-2","purpose":"runtime_handoff","usage":{"output_tokens":2},"invocation":{}}}`
+	appendRequestFixture(t, path, partial)
+	facts, partialCursor, err := ScanDeepworkRequestUsageIncremental(path, cursor)
+	if err != nil || len(facts) != 0 || partialCursor.Offset != cursor.Offset {
+		t.Fatalf("partial facts=%+v cursor=%+v err=%v", facts, partialCursor, err)
+	}
+	appendRequestFixture(t, path, "\n")
+	facts, _, err = ScanDeepworkRequestUsageIncremental(path, partialCursor)
+	if err != nil || len(facts) != 1 || facts[0].OutputTokens != 2 {
+		t.Fatalf("completed facts=%+v err=%v", facts, err)
+	}
+}
+
+func TestScanDeepworkRequestUsageIncludesUsageLessFailedAttempts(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dw-10.jsonl")
+	data := `{"format":"deepwork.native_transcript.v1.4","runtime":"whale-agent","type":"assistant","sessionId":"dw-10","deepworkTurnId":5,"timestamp":"2026-08-03T01:00:00Z","requestId":"inv-main","message":{"role":"assistant","content":[],"status":"error","error":"connection failed","invocation":{"runtime_id":"whale-agent","provider_key":"deepseek","requested_model":"deepseek-chat"},"auxiliary_invocations":[{"id":"inv-vision","purpose":"vision_assist","status":"canceled","error":"context canceled","invocation":{"runtime_id":"whale-agent","provider_key":"deepseek","requested_model":"deepseek-vl"}}]}}` + "\n" +
+		`{"format":"deepwork.native_transcript.v1.4","runtime":"whale-agent","type":"invocation","sessionId":"dw-10","deepworkTurnId":5,"timestamp":"2026-08-03T01:00:01Z","attempt":{"id":"inv-title","purpose":"auto_title","status":"error","error":"timeout","invocation":{"runtime_id":"whale-agent","provider_key":"deepseek","requested_model":"deepseek-chat"}}}` + "\n"
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	facts, err := ScanDeepworkRequestUsage(path)
+	if err != nil || len(facts) != 3 {
+		t.Fatalf("facts=%+v err=%v", facts, err)
+	}
+	for _, fact := range facts {
+		if fact.Coverage.Tokens != CoverageMissing {
+			t.Fatalf("usage-less attempt claimed measured tokens: %+v", fact)
+		}
+		if len(fact.Diagnostics) == 0 {
+			t.Fatalf("attempt terminal diagnostics missing: %+v", fact)
+		}
+	}
+}
+
+func TestScanDeepworkRequestUsageRejectsConflictingImmutableID(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dw-11.jsonl")
+	data := `{"type":"invocation","sessionId":"dw-11","deepworkTurnId":1,"timestamp":"2026-08-03T01:00:00Z","attempt":{"id":"inv-same","purpose":"auto_title","status":"success","usage":{"output_tokens":1},"invocation":{}}}` + "\n" +
+		`{"type":"invocation","sessionId":"dw-11","deepworkTurnId":1,"timestamp":"2026-08-03T01:00:01Z","attempt":{"id":"inv-same","purpose":"auto_title","status":"success","usage":{"output_tokens":2},"invocation":{}}}` + "\n"
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ScanDeepworkRequestUsage(path); err == nil || !strings.Contains(err.Error(), "deepwork_request_fact_conflict") {
+		t.Fatalf("conflicting immutable ID must fail closed, got %v", err)
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -34,6 +35,228 @@ type RequestCoverage struct {
 	Billing  CoverageState `json:"billing"`
 	Timing   CoverageState `json:"timing"`
 	CacheTTL CoverageState `json:"cache_ttl"`
+}
+
+// DeepworkRequestCursor is the append-only parser state for a Whale native
+// transcript. Offset stops before a partial tail so the next refresh can parse
+// the completed record exactly once.
+type DeepworkRequestCursor struct {
+	Offset         int64 `json:"offset"`
+	MalformedLines int64 `json:"malformed_lines"`
+}
+
+// ScanDeepworkRequestUsage projects Whale assistant and lifecycle invocation
+// attempts into request-grain economic facts.
+func ScanDeepworkRequestUsage(path string) ([]ModelRequestUsage, error) {
+	facts, _, err := ScanDeepworkRequestUsageIncremental(path, DeepworkRequestCursor{})
+	return facts, err
+}
+
+func ScanDeepworkRequestUsageIncremental(path string, cursor DeepworkRequestCursor) ([]ModelRequestUsage, DeepworkRequestCursor, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, cursor, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, cursor, err
+	}
+	if cursor.Offset < 0 || cursor.Offset > info.Size() {
+		cursor = DeepworkRequestCursor{}
+	}
+	if _, err := f.Seek(cursor.Offset, io.SeekStart); err != nil {
+		return nil, cursor, err
+	}
+
+	sessionFallback := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	byID := map[string]*ModelRequestUsage{}
+	fingerprints := map[string]string{}
+	order := make([]string, 0, 64)
+	br := bufio.NewReaderSize(f, 256*1024)
+	offset := cursor.Offset
+	for {
+		lineBytes, readErr := br.ReadBytes('\n')
+		lineOffset := offset
+		if readErr == io.EOF && len(lineBytes) > 0 && lineBytes[len(lineBytes)-1] != '\n' {
+			break
+		}
+		offset = lineOffset + int64(len(lineBytes))
+		trimmed := bytes.TrimSpace(lineBytes)
+		if len(trimmed) > 0 {
+			var line NativeEntry
+			if err := json.Unmarshal(trimmed, &line); err != nil {
+				cursor.MalformedLines++
+			} else {
+				sessionID := firstNonEmpty(line.SessionID, sessionFallback)
+				switch line.Type {
+				case "assistant":
+					if line.Message != nil {
+						identity := NativeInvocationIdentity{}
+						if line.Message.Invocation != nil {
+							identity = *line.Message.Invocation
+						}
+						requestID := firstNonEmpty(line.RequestID, line.Message.ID)
+						if err := appendDeepworkUsageFact(byID, fingerprints, &order, sessionID, requestID, lineOffset, line.Timestamp,
+							line.DeepworkTurnID, line.Runtime, line.Message.Model, identity, line.Message.Usage, 0, path, "",
+							line.Message.Status, line.Message.Error, false, line.Message); err != nil {
+							return nil, cursor, err
+						}
+						for i := range line.Message.AuxiliaryInvocations {
+							attempt := line.Message.AuxiliaryInvocations[i]
+							auxID := attempt.ID
+							syntheticID := auxID == ""
+							fallbackID := fmt.Sprintf("%s:aux:%d", firstNonEmpty(requestID, fmt.Sprintf("offset-%d", lineOffset)), i)
+							if auxID == "" {
+								auxID = fallbackID
+							}
+							if err := appendDeepworkUsageFact(byID, fingerprints, &order, sessionID, auxID, lineOffset, line.Timestamp,
+								line.DeepworkTurnID, line.Runtime, "", attempt.Invocation, attempt.Usage,
+								attempt.DurationMs, path, attempt.Purpose, attempt.Status, attempt.Error, syntheticID, attempt); err != nil {
+								return nil, cursor, err
+							}
+						}
+					}
+				case "invocation":
+					if line.Attempt != nil {
+						if err := appendDeepworkUsageFact(byID, fingerprints, &order, sessionID, line.Attempt.ID, lineOffset, line.Timestamp,
+							line.DeepworkTurnID, line.Runtime, "", line.Attempt.Invocation, line.Attempt.Usage,
+							line.Attempt.DurationMs, path, line.Attempt.Purpose, line.Attempt.Status, line.Attempt.Error, false, line.Attempt); err != nil {
+							return nil, cursor, err
+						}
+					}
+				}
+			}
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			cursor.Offset = offset
+			return nil, cursor, readErr
+		}
+	}
+
+	out := make([]ModelRequestUsage, 0, len(order))
+	for _, id := range order {
+		out = append(out, *byID[id])
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].At.Equal(out[j].At) {
+			return out[i].SourceOffset < out[j].SourceOffset
+		}
+		return out[i].At.Before(out[j].At)
+	})
+	cursor.Offset = offset
+	return out, cursor, nil
+}
+
+func appendDeepworkUsageFact(
+	byID map[string]*ModelRequestUsage,
+	fingerprints map[string]string,
+	order *[]string,
+	sessionID, requestID string,
+	sourceOffset int64,
+	timestamp string,
+	turnID int64,
+	entryRuntime, messageModel string,
+	identity NativeInvocationIdentity,
+	usage *NativeUsage,
+	durationMs int,
+	path, purpose, status, attemptError string,
+	forcePartialIdentity bool,
+	immutable any,
+) error {
+	identityCoverage := CoverageComplete
+	requestID = strings.TrimSpace(requestID)
+	if requestID == "" {
+		requestID = fmt.Sprintf("offset-%d", sourceOffset)
+		identityCoverage = CoveragePartial
+	}
+	if forcePartialIdentity {
+		identityCoverage = CoveragePartial
+	}
+	id := "deepwork:" + sessionID + ":" + requestID
+	wire, err := json.Marshal(immutable)
+	if err != nil {
+		return fmt.Errorf("marshal deepwork request %s: %w", id, err)
+	}
+	fingerprint := string(wire)
+	if prior, ok := fingerprints[id]; ok {
+		if prior != fingerprint {
+			return fmt.Errorf("deepwork_request_fact_conflict: %s", id)
+		}
+		return nil
+	}
+	fingerprints[id] = fingerprint
+	at, _ := time.Parse(time.RFC3339Nano, timestamp)
+	model := firstNonEmpty(identity.ResolvedModel, messageModel, identity.RequestedModel)
+	modelCoverage := presentCoverage(model)
+	if identity.ResolvedModel == "" && model != "" {
+		modelCoverage = CoveragePartial
+	}
+	runtime := firstNonEmpty(identity.RuntimeID, entryRuntime, "whale-agent")
+	fact := byID[id]
+	if fact == nil {
+		tokenCoverage := CoverageMissing
+		if usage != nil {
+			tokenCoverage = CoverageComplete
+		}
+		fact = &ModelRequestUsage{
+			ID: id, Runtime: runtime, Provider: identity.ProviderKey,
+			SessionID: sessionID, WorkItemID: strconv.FormatInt(turnID, 10),
+			Model: model, At: at, EndedAt: timePtrUnlessZero(at),
+			SourceRef: filepath.Base(path), SourceOffset: sourceOffset,
+			Coverage: RequestCoverage{
+				Identity: identityCoverage, Model: modelCoverage, Tokens: tokenCoverage,
+				Effort: CoverageMissing, Tier: CoverageMissing, Billing: CoverageMissing,
+				Timing: CoverageMissing, CacheTTL: CoveragePartial,
+			},
+		}
+		if durationMs > 0 && !at.IsZero() {
+			started := at.Add(-time.Duration(durationMs) * time.Millisecond)
+			fact.StartedAt = &started
+			fact.Coverage.Timing = CoverageComplete
+		}
+		if purpose != "" {
+			fact.Diagnostics = append(fact.Diagnostics, "lifecycle_purpose="+purpose)
+		}
+		if status != "" {
+			fact.Diagnostics = append(fact.Diagnostics, "attempt_status="+status)
+		}
+		if attemptError != "" {
+			fact.Diagnostics = append(fact.Diagnostics, "attempt_error="+attemptError)
+		}
+		byID[id] = fact
+		*order = append(*order, id)
+	}
+	if usage == nil {
+		return nil
+	}
+	rawInput := int64Value(usage.InputTokens)
+	cacheRead := int64Value(usage.CacheReadTokens)
+	cacheCreate := int64Value(usage.CacheCreateTokens)
+	// Whale's OpenAI-compatible gateways report input_tokens as the inclusive
+	// prompt total. ModelRequestUsage token classes are disjoint, so keep the raw
+	// provider counter for audit and expose only fresh input in InputTokens.
+	freshInput := rawInput - cacheRead - cacheCreate
+	if freshInput < 0 {
+		freshInput = 0
+	}
+	fact.RawInputTokens = maxInt64(fact.RawInputTokens, rawInput)
+	fact.InputTokens = maxInt64(fact.InputTokens, freshInput)
+	fact.CachedInputTokens = maxInt64(fact.CachedInputTokens, cacheRead)
+	fact.CacheWriteUnknownTokens = maxInt64(fact.CacheWriteUnknownTokens, cacheCreate)
+	fact.OutputTokens = maxInt64(fact.OutputTokens, int64Value(usage.OutputTokens))
+	fact.ReasoningOutputTokens = maxInt64(fact.ReasoningOutputTokens, int64Value(usage.ThinkingTokens))
+	return nil
+}
+
+func int64Value(value *int) int64 {
+	if value == nil {
+		return 0
+	}
+	return int64(*value)
 }
 
 // ModelRequestUsage is the provider-neutral, request-grain economic fact.

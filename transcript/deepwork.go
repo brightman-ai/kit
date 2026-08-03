@@ -262,6 +262,8 @@ func (s *DeepworkSource) loadFromFile(path, id string) (tr *Transcript, ok bool,
 	tr = &Transcript{Source: KindDeepwork, Ref: id, Meta: map[string]interface{}{}}
 	var totalIn, totalOut, totalCacheRead int
 	var sawUsage bool
+	seenInvocations := map[string]string{}
+	var invocations []map[string]interface{}
 	openTurn := false
 	lineNo := 0
 
@@ -295,6 +297,27 @@ func (s *DeepworkSource) loadFromFile(path, id string) (tr *Transcript, ok bool,
 				return nil, false, fmt.Errorf("deepwork transcript %s contains an assistant message outside a user turn", id)
 			}
 			s.appendAssistantTurn(tr, &line, &totalIn, &totalOut, &totalCacheRead, &sawUsage)
+			if line.Message == nil {
+				continue
+			}
+			for i := range line.Message.AuxiliaryInvocations {
+				meta, usage, duplicate, consumeErr := consumeNativeInvocation(
+					&line.Message.AuxiliaryInvocations[i], line.DeepworkTurnID, line.Timestamp, seenInvocations,
+				)
+				if consumeErr != nil {
+					return nil, false, fmt.Errorf("deepwork transcript %s line %d: %w", id, lineNo, consumeErr)
+				}
+				if duplicate {
+					continue
+				}
+				invocations = append(invocations, meta)
+				if usage != nil {
+					totalIn += intField(usage, "input_tokens")
+					totalOut += intField(usage, "output_tokens")
+					totalCacheRead += intField(usage, "cache_read_input_tokens")
+					sawUsage = true
+				}
+			}
 		case "result":
 			if !openTurn {
 				return nil, false, fmt.Errorf("deepwork transcript %s contains a result without an open user turn", id)
@@ -306,6 +329,21 @@ func (s *DeepworkSource) loadFromFile(path, id string) (tr *Transcript, ok bool,
 			// skipped result line → replay 总耗时 blank.
 			attachResultDuration(tr, &line)
 			openTurn = false
+		case "invocation":
+			meta, usage, duplicate, consumeErr := consumeNativeInvocation(line.Attempt, line.DeepworkTurnID, line.Timestamp, seenInvocations)
+			if consumeErr != nil {
+				return nil, false, fmt.Errorf("deepwork transcript %s line %d: %w", id, lineNo, consumeErr)
+			}
+			if duplicate {
+				continue
+			}
+			invocations = append(invocations, meta)
+			if usage != nil {
+				totalIn += intField(usage, "input_tokens")
+				totalOut += intField(usage, "output_tokens")
+				totalCacheRead += intField(usage, "cache_read_input_tokens")
+				sawUsage = true
+			}
 		default:
 			// progress / unknown → not a standalone reread block (per-token `progress`
 			// events are the live stream, not reread).
@@ -327,8 +365,39 @@ func (s *DeepworkSource) loadFromFile(path, id string) (tr *Transcript, ok bool,
 		tr.Meta["output_tokens"] = totalOut
 		tr.Meta["cache_read_tokens"] = totalCacheRead
 	}
+	if len(invocations) > 0 {
+		tr.Meta["invocations"] = invocations
+	}
 	tr.Title = firstNonEmpty(transcriptFirstUser(tr), "deepwork session "+shortID(id))
 	return tr, true, nil
+}
+
+func consumeNativeInvocation(attempt *NativeInvocationAttempt, turnID int64, timestamp string, seen map[string]string) (map[string]interface{}, map[string]interface{}, bool, error) {
+	if attempt == nil || strings.TrimSpace(attempt.ID) == "" {
+		return nil, nil, false, fmt.Errorf("invocation has no attempt id")
+	}
+	wire, err := json.Marshal(attempt)
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("marshal invocation %s: %w", attempt.ID, err)
+	}
+	if prior, ok := seen[attempt.ID]; ok {
+		if prior != string(wire) {
+			return nil, nil, false, fmt.Errorf("invocation_attempt_conflict: %s", attempt.ID)
+		}
+		return nil, nil, true, nil
+	}
+	seen[attempt.ID] = string(wire)
+	meta := map[string]interface{}{
+		"id": attempt.ID, "purpose": attempt.Purpose, "status": attempt.Status,
+		"error": attempt.Error, "duration_ms": attempt.DurationMs,
+		"turn_id": turnID, "at": timestamp,
+		"runtime":             attempt.Invocation.RuntimeID,
+		"provider_account_id": attempt.Invocation.ProviderAccountID,
+		"provider":            attempt.Invocation.ProviderKey,
+		"requested_model":     attempt.Invocation.RequestedModel,
+		"resolved_model":      attempt.Invocation.ResolvedModel,
+	}
+	return meta, nativeUsageMap(attempt.Usage), false, nil
 }
 
 // appendUserTurn mirrors Claude's causal vocabulary: an internal user message

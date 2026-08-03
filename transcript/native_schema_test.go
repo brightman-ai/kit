@@ -19,7 +19,7 @@ import (
 func TestNativeSchemaRoundTrip(t *testing.T) {
 	in, out, cacheRead := 120, 42, 10
 	assistant := NativeEntry{
-		Format:    "deepwork.native_transcript.v1.3",
+		Format:    "deepwork.native_transcript.v1.4",
 		Type:      "assistant",
 		SessionID: "dw-900",
 		Timestamp: "2026-06-17T01:00:05Z",
@@ -43,7 +43,7 @@ func TestNativeSchemaRoundTrip(t *testing.T) {
 				ResolvedSource: "provider_response", CatalogRevision: "catalog-r7", ConfigRevision: "config-r7",
 			},
 			AuxiliaryInvocations: []NativeInvocationAttempt{{
-				Purpose: "vision_assist", Status: "success", Output: "a whale",
+				ID: "inv-vision", Purpose: "vision_assist", Status: "success", Output: "a whale", DurationMs: 321,
 				Invocation: NativeInvocationIdentity{RuntimeID: "whale-agent", ProviderAccountID: "account-a", RequestedModel: "vision-model"},
 			}},
 			Status: "success",
@@ -59,7 +59,9 @@ func TestNativeSchemaRoundTrip(t *testing.T) {
 	}
 	if wireCopy.Message == nil || wireCopy.Message.Invocation == nil ||
 		wireCopy.Message.Invocation.ConfigRevision != "config-r7" ||
-		len(wireCopy.Message.AuxiliaryInvocations) != 1 {
+		len(wireCopy.Message.AuxiliaryInvocations) != 1 ||
+		wireCopy.Message.AuxiliaryInvocations[0].ID != "inv-vision" ||
+		wireCopy.Message.AuxiliaryInvocations[0].DurationMs != 321 {
 		t.Fatalf("invocation facts did not round-trip: %#v", wireCopy.Message)
 	}
 

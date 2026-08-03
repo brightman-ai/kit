@@ -3,7 +3,7 @@ package transcript
 import "encoding/json"
 
 // native_schema.go is the SINGLE SSOT for the Deepwork Native Transcript JSONL
-// wire schema (deepwork.native_transcript.v1 through v1.3). Before this file the
+// wire schema (deepwork.native_transcript.v1 through v1.4). Before this file the
 // shape was declared TWICE — once as an unexported READ view here
 // (deepwork_raw.go's former dwLine/dwMessage/dwContentBlock/dwUsage/dwMetrics)
 // and once as the WRITE model in a host's worktranscript package
@@ -22,7 +22,7 @@ import "encoding/json"
 type NativeEntry struct {
 	Format            string          `json:"format,omitempty"`
 	Runtime           string          `json:"runtime,omitempty"`
-	Type              string          `json:"type"` // user | assistant | result | progress
+	Type              string          `json:"type"` // user | assistant | result | progress | invocation
 	UUID              string          `json:"uuid,omitempty"`
 	ParentUUID        *string         `json:"parentUuid"`
 	SessionID         string          `json:"sessionId"`
@@ -70,6 +70,12 @@ type NativeEntry struct {
 	// UserType mirrors claude ("external" for a human turn, "internal" for one the
 	// runtime synthesised, e.g. a tool_result fed back in). Empty = unspecified.
 	UserType string `json:"userType,omitempty"`
+
+	// Attempt (v1.4) is a model call that belongs to the session lifecycle but
+	// not to the chat DAG (auto title, runtime handoff, and future maintenance
+	// calls). It is carried by a standalone type="invocation" entry. Readers must
+	// account for it without projecting a user/assistant turn.
+	Attempt *NativeInvocationAttempt `json:"attempt,omitempty"`
 }
 
 // NativeMessage is the inner message object for user/assistant lines.
@@ -118,10 +124,12 @@ type NativeInvocationIdentity struct {
 }
 
 type NativeInvocationAttempt struct {
+	ID         string                   `json:"id,omitempty"`
 	Purpose    string                   `json:"purpose,omitempty"`
 	Output     string                   `json:"output,omitempty"`
 	Status     string                   `json:"status,omitempty"`
 	Error      string                   `json:"error,omitempty"`
+	DurationMs int                      `json:"duration_ms,omitempty"`
 	Usage      *NativeUsage             `json:"usage,omitempty"`
 	Invocation NativeInvocationIdentity `json:"invocation"`
 }
