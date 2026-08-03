@@ -71,11 +71,29 @@ var priceTable = []priceEntry{
 	// Gemini generic fallback.
 	{"gemini", ModelPrice{Tier: Tier{1.25, 10, 0.125, 0, 0}, Currency: "USD"}},
 
-	// ── Chinese vendors (CNY per MILLION tokens; no cache tier, no context tier) ─
+	// ── Moonshot / Kimi (USD per MILLION tokens; no cache-write tier) ───────────
+	// Kimi bills in USD on platform.kimi.ai. Listed per model, NOT as a generic
+	// "kimi" family: k3 and the k2.x line differ by 5×, so a family fallback would
+	// price a future model by coincidence. Same rule OpenAI/Anthropic follow above.
+	// "k3" is the bare id codex records; "kimi-k3" is the canonical one.
+	{"kimi-k3", ModelPrice{Tier: Tier{3, 15, 0.30, 0, 0}, Currency: "USD"}},
+	{"k3", ModelPrice{Tier: Tier{3, 15, 0.30, 0, 0}, Currency: "USD"}},
+	{"kimi-k2.5", ModelPrice{Tier: Tier{0.6, 3, 0.1, 0, 0}, Currency: "USD"}},
+
+	// ── DeepSeek (USD per MILLION tokens; no cache-write tier) ──────────────────
+	// Was a single generic "deepseek" key at CNY {1, 2, 0.1} — a V3-era number that
+	// had gone stale in both the price AND the currency, and that a generic key let
+	// silently apply to every future model. Now per model, from DeepSeek's own
+	// pricing page (LiteLLM agrees to the digit). No generic fallback: v4-flash and
+	// v4-pro differ by ~3×.
+	{"deepseek-v4-flash", ModelPrice{Tier: Tier{0.14, 0.28, 0.0028, 0, 0}, Currency: "USD"}},
+	{"deepseek-v4-pro", ModelPrice{Tier: Tier{0.435, 0.87, 0.003625, 0, 0}, Currency: "USD"}},
+	{"deepseek-chat", ModelPrice{Tier: Tier{0.28, 0.42, 0.028, 0, 0}, Currency: "USD"}},
+
+	// ── Other Chinese vendors (CNY per MILLION tokens; no cache tier) ───────────
 	// Official vendor list prices. Currency is CNY — Cost() returns CNY for these.
 	{"glm-4-flash", ModelPrice{Tier: Tier{0.1, 0.1, 0, 0, 0}, Currency: "CNY"}},
 	{"glm", ModelPrice{Tier: Tier{5, 5, 0, 0, 0}, Currency: "CNY"}},
-	{"deepseek", ModelPrice{Tier: Tier{1, 2, 0.1, 0, 0}, Currency: "CNY"}},
 	{"qwen-max", ModelPrice{Tier: Tier{2.4, 9.6, 0, 0, 0}, Currency: "CNY"}},
 	{"qwen", ModelPrice{Tier: Tier{0.8, 2, 0, 0, 0}, Currency: "CNY"}},
 }

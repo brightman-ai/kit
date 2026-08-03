@@ -8,8 +8,13 @@ import (
 // CatalogVersion identifies the immutable pricing snapshot used by a quote.
 // Updating a price creates new effective-dated rules and a new version; it does
 // not rewrite historical request facts.
-const CatalogVersion = "2026-07-15.2"
+const CatalogVersion = "2026-08-03.1"
 const FastModeSourceURL = "https://developers.openai.com/codex/agent-configuration/speed"
+
+// catalogSnapshotDate is when the bulk of this catalog was last transcribed from upstream. A rule
+// that carries no verifiedAt of its own inherits it, so EVERY quote can state its own age; a rule
+// with no age at all would silently read as current.
+var catalogSnapshotDate = mustDate("2026-07-15")
 
 // RequestQuery contains only request-time billing evidence. Effort is retained
 // for explainability but deliberately does not participate in unit-price
@@ -30,8 +35,21 @@ type RequestQuote struct {
 	SourceURL      string
 	EffectiveFrom  time.Time
 	EffectiveUntil *time.Time
-	Price          ModelPrice
-	CreditsPerM    *Tier
+	// VerifiedAt is the day a human last read SourceURL and confirmed these
+	// numbers. It answers a different question from EffectiveFrom, and the
+	// difference is the whole point:
+	//
+	//	EffectiveFrom — when the VENDOR says this price started.
+	//	VerifiedAt    — when WE last checked that the vendor still says it.
+	//
+	// An embedded price table cannot notice a price change; the only honest
+	// mitigation is to publish its own age, so a reader can see the number is
+	// three months old and go look. Rendering EffectiveFrom instead would be
+	// worse than nothing: an untouched rule from January keeps claiming a
+	// January date forever and reads as freshness.
+	VerifiedAt  time.Time
+	Price       ModelPrice
+	CreditsPerM *Tier
 }
 
 // Cost evaluates one request using this quote. Reasoning output must not be
@@ -63,6 +81,10 @@ type catalogRule struct {
 	price       ModelPrice
 	creditsPerM *Tier
 	sourceURL   string
+	// verifiedAt is when a human last checked sourceURL. Zero means never
+	// individually verified, and falls back to the catalog snapshot date — see
+	// RequestQuote.VerifiedAt for why this is a separate fact from `from`.
+	verifiedAt time.Time
 }
 
 // Catalog owns effective-dated request pricing. It is immutable after build.
@@ -90,10 +112,14 @@ func (c Catalog) Quote(q RequestQuery) (RequestQuote, bool) {
 		if !matchesAnyModel(model, rule.models) {
 			continue
 		}
+		verified := rule.verifiedAt
+		if verified.IsZero() {
+			verified = catalogSnapshotDate
+		}
 		return RequestQuote{
 			RuleID: rule.id, CatalogVersion: CatalogVersion, SourceURL: rule.sourceURL,
-			EffectiveFrom: rule.from, EffectiveUntil: rule.until, Price: rule.price,
-			CreditsPerM: rule.creditsPerM,
+			EffectiveFrom: rule.from, EffectiveUntil: rule.until, VerifiedAt: verified,
+			Price: rule.price, CreditsPerM: rule.creditsPerM,
 		}, true
 	}
 	return RequestQuote{}, false
@@ -120,6 +146,9 @@ func buildCatalogRules() []catalogRule {
 	openAIModels := "https://developers.openai.com/api/docs/models/"
 	openAIPricing := "https://developers.openai.com/api/docs/pricing"
 	claudePricing := "https://platform.claude.com/docs/en/about-claude/pricing"
+	kimiPricing := "https://platform.kimi.ai/docs/pricing/chat-k3"
+	deepseekPricing := "https://api-docs.deepseek.com/quick_start/pricing"
+	thirdPartyVerified := mustDate("2026-08-03")
 	credits := func(in, cached, out float64) *Tier {
 		return &Tier{InputPerM: in, CacheReadPerM: cached, OutputPerM: out}
 	}
@@ -181,6 +210,49 @@ func buildCatalogRules() []catalogRule {
 			price: ModelPrice{Tier: Tier{InputPerM: 3, CacheReadPerM: .3, OutputPerM: 15, CacheWrite5mPerM: 3.75, CacheWrite1hPerM: 6}, Currency: "USD"}, sourceURL: claudePricing},
 		{id: "anthropic.claude-haiku-4-5.standard.v1", models: []string{"claude-haiku-4-5"}, serviceTier: "standard", from: from2026,
 			price: ModelPrice{Tier: Tier{InputPerM: 1, CacheReadPerM: .1, OutputPerM: 5, CacheWrite5mPerM: 1.25, CacheWrite1hPerM: 2}, Currency: "USD"}, sourceURL: claudePricing},
+
+		// ── third-party vendors ───────────────────────────────────────────────────────────────
+		//
+		// These exist because a first-party CLI can now be pointed at anyone's endpoint, and an
+		// unpriced model does not just lose its own number — it turns its whole row's total into
+		// 「—」. Until these rules landed, a codex window containing gpt-5.6-sol AND k3 could show
+		// no money at all.
+		//
+		// Two properties they must keep:
+		//
+		//  1. They are the VENDOR'S LIST price, not this user's contract. A relay ("mimo2codex-…"
+		//     in the wild) resells at its own rate, and this catalog cannot know it. That is why
+		//     the surface says 估算 and never 账单.
+		//  2. `from: from2026` follows the file's existing convention: it dates the current price
+		//     ERA, not the model's launch. A rule for a model that did not exist yet simply never
+		//     matches a fact, so an early date invents nothing — whereas guessing a launch date
+		//     would, and would leave real usage silently unpriced if guessed late.
+		//
+		// Neither vendor publishes a cache-WRITE charge (cache writes are free / not billed
+		// separately), hence CacheWrite5m == CacheWrite1h == 0 — the same shape OpenAI and Gemini
+		// already use here. No long-context premium is published either.
+		//
+		// kimi-k3: codex records this model bare as "k3" (~/.codex/sessions/**), so the bare id is
+		// listed alongside the canonical one — matchesAnyModel is exact-or-prefix, not substring.
+		// $0.30 cache-hit input / $3.00 cache-miss input / $15.00 output per 1M, ex-tax.
+		// NOTE: absent from LiteLLM's snapshot entirely (its newest moonshot entry is kimi-k2.5),
+		// so this one cannot be refreshed from there — it is read off Moonshot's own price page.
+		{id: "moonshot.kimi-k3.standard.v1", models: []string{"kimi-k3", "k3"}, serviceTier: "standard", from: from2026,
+			price:     ModelPrice{Tier: Tier{InputPerM: 3, CacheReadPerM: 0.30, OutputPerM: 15}, Currency: "USD"},
+			sourceURL: kimiPricing, verifiedAt: thirdPartyVerified},
+
+		// deepseek: $0.14 / $0.0028 / $0.28 (flash) and $0.435 / $0.003625 / $0.87 (pro) per 1M.
+		// Cross-checked two ways — DeepSeek's own pricing page and LiteLLM's
+		// model_prices_and_context_window.json agree to the digit.
+		// Announced but NOT yet in effect: a peak-hours 2× multiplier (09:00–12:00 / 14:00–18:00
+		// CST). Deliberately not modelled — an unannounced effective date would make every priced
+		// request in those hours wrong by 2×. When it lands it is a new effective-dated rule.
+		{id: "deepseek.v4-flash.standard.v1", models: []string{"deepseek-v4-flash"}, serviceTier: "standard", from: from2026,
+			price:     ModelPrice{Tier: Tier{InputPerM: 0.14, CacheReadPerM: 0.0028, OutputPerM: 0.28}, Currency: "USD"},
+			sourceURL: deepseekPricing, verifiedAt: thirdPartyVerified},
+		{id: "deepseek.v4-pro.standard.v1", models: []string{"deepseek-v4-pro"}, serviceTier: "standard", from: from2026,
+			price:     ModelPrice{Tier: Tier{InputPerM: 0.435, CacheReadPerM: 0.003625, OutputPerM: 0.87}, Currency: "USD"},
+			sourceURL: deepseekPricing, verifiedAt: thirdPartyVerified},
 	}
 }
 
