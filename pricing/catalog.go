@@ -85,6 +85,74 @@ type catalogRule struct {
 	// individually verified, and falls back to the catalog snapshot date — see
 	// RequestQuote.VerifiedAt for why this is a separate fact from `from`.
 	verifiedAt time.Time
+	// alsoPublishedAs are OTHER rate cards the same vendor publishes for the same model.
+	//
+	// Not a currency conversion. Moonshot sells kimi-k3 on two platforms at two list prices
+	// (¥20/¥100 per 1M on platform.moonshot.cn, $3.00/$15.00 on platform.kimi.ai) and both are
+	// real published numbers, so a surface can show both WITHOUT this codebase ever holding an
+	// exchange rate. That matters: an FX rate is a third fact with its own source and its own
+	// staleness, and inventing one to make two currencies comparable is exactly the kind of
+	// fabricated number the rest of this package refuses.
+	//
+	// Which card actually applies is the user's contract, which no transcript records. Showing
+	// them side by side is how the report says "it is one of these two" without pretending to
+	// know which.
+	alsoPublishedAs []publishedPrice
+}
+
+// publishedPrice is one vendor-published rate card, with the page it was read from.
+type publishedPrice struct {
+	price     ModelPrice
+	sourceURL string
+}
+
+// RateCard is a published price for a model, as a surface should show it: an explicit currency,
+// the per-million rates, and the page that says so.
+type RateCard struct {
+	Currency      string  `json:"currency"`
+	InputPerM     float64 `json:"input_per_m"`
+	OutputPerM    float64 `json:"output_per_m"`
+	CacheReadPerM float64 `json:"cache_read_per_m"`
+	SourceURL     string  `json:"source_url,omitempty"`
+	// Primary marks the card the money on screen was actually computed with. The others are
+	// context, shown so the number cannot be misread as the wrong currency.
+	Primary bool `json:"primary,omitempty"`
+}
+
+func rateCard(price ModelPrice, sourceURL string, primary bool) RateCard {
+	return RateCard{
+		Currency: price.Currency, InputPerM: price.InputPerM, OutputPerM: price.OutputPerM,
+		CacheReadPerM: price.CacheReadPerM, SourceURL: sourceURL, Primary: primary,
+	}
+}
+
+// PublishedRates returns every rate card known for a model, the one used for money first.
+//
+// It exists so a report can state its own unit price instead of leaving the reader to infer the
+// currency from a symbol. On this machine that inference was a real trap: Kimi publishes ¥20/M and
+// $3.00/M for the same model, 6.67× apart, and a bare "$85.93" gives no way to tell which list
+// produced it.
+//
+// Empty means unpriced, which the caller must render as such rather than as free.
+func PublishedRates(model string) []RateCard {
+	at := time.Now().UTC()
+	for _, rule := range defaultCatalog.rules {
+		if rule.serviceTier != "standard" || at.Before(rule.from) || (rule.until != nil && !at.Before(*rule.until)) {
+			continue
+		}
+		if !matchesAnyModel(normalize(model), rule.models) {
+			continue
+		}
+		cards := []RateCard{rateCard(rule.price, rule.sourceURL, true)}
+		for _, alt := range rule.alsoPublishedAs {
+			cards = append(cards, rateCard(alt.price, alt.sourceURL, false))
+		}
+		return cards
+	}
+	if quote, ok := QuoteFromSnapshot(model, "standard"); ok {
+		return []RateCard{rateCard(quote.Price, quote.SourceURL, true)}
+	}
+	return nil
 }
 
 // Catalog owns effective-dated request pricing. It is immutable after build.
@@ -199,8 +267,10 @@ func buildCatalogRules() []catalogRule {
 	openAIPricing := "https://developers.openai.com/api/docs/pricing"
 	claudePricing := "https://platform.claude.com/docs/en/about-claude/pricing"
 	kimiPricing := "https://platform.kimi.ai/docs/pricing/chat-k3"
+	kimiPricingCN := "https://platform.moonshot.cn/docs/pricing/chat-k3"
 	deepseekPricing := "https://api-docs.deepseek.com/quick_start/pricing"
 	thirdPartyVerified := mustDate("2026-08-03")
+	kimiVerified := mustDate("2026-08-04")
 	credits := func(in, cached, out float64) *Tier {
 		return &Tier{InputPerM: in, CacheReadPerM: cached, OutputPerM: out}
 	}
@@ -288,10 +358,28 @@ func buildCatalogRules() []catalogRule {
 		// listed alongside the canonical one — matchesAnyModel is exact-or-prefix, not substring.
 		// $0.30 cache-hit input / $3.00 cache-miss input / $15.00 output per 1M, ex-tax.
 		// NOTE: absent from LiteLLM's snapshot entirely (its newest moonshot entry is kimi-k2.5),
-		// so this one cannot be refreshed from there — it is read off Moonshot's own price page.
-		{id: "moonshot.kimi-k3.standard.v1", models: []string{"kimi-k3", "k3"}, serviceTier: "standard", from: from2026,
-			price:     ModelPrice{Tier: Tier{InputPerM: 3, CacheReadPerM: 0.30, OutputPerM: 15}, Currency: "USD"},
-			sourceURL: kimiPricing, verifiedAt: thirdPartyVerified},
+		// so this one cannot be refreshed from there — it is read off Moonshot's own price pages.
+		//
+		// TWO published lists, priced in CNY by default:
+		//
+		//	platform.moonshot.cn   ¥2.00 cache-hit / ¥20.00 input / ¥100.00 output  per 1M
+		//	platform.kimi.ai       $0.30            / $3.00       / $15.00          per 1M
+		//
+		// They are the same price at Moonshot's own 6.67 conversion, not two different offers. CNY
+		// is primary because that is the platform this user actually bills against: their
+		// `mimo2codex-kimi-coding` provider is a LOCAL protocol adapter (127.0.0.1:8788), not a
+		// reseller, so the money goes to Moonshot directly on a domestic account.
+		//
+		// The USD list rides along in alsoPublishedAs so the surface can show both. Without it a
+		// bare "¥573" or "$85.93" is unfalsifiable — 6.67× is exactly the size of error that looks
+		// plausible.
+		{id: "moonshot.kimi-k3.standard.v2", models: []string{"kimi-k3", "k3"}, serviceTier: "standard", from: from2026,
+			price:     ModelPrice{Tier: Tier{InputPerM: 20, CacheReadPerM: 2, OutputPerM: 100}, Currency: "CNY"},
+			sourceURL: kimiPricingCN, verifiedAt: kimiVerified,
+			alsoPublishedAs: []publishedPrice{{
+				price:     ModelPrice{Tier: Tier{InputPerM: 3, CacheReadPerM: 0.30, OutputPerM: 15}, Currency: "USD"},
+				sourceURL: kimiPricing,
+			}}},
 
 		// deepseek: $0.14 / $0.0028 / $0.28 (flash) and $0.435 / $0.003625 / $0.87 (pro) per 1M.
 		// Cross-checked two ways — DeepSeek's own pricing page and LiteLLM's

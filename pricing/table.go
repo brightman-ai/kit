@@ -71,14 +71,22 @@ var priceTable = []priceEntry{
 	// Gemini generic fallback.
 	{"gemini", ModelPrice{Tier: Tier{1.25, 10, 0.125, 0, 0}, Currency: "USD"}},
 
-	// ── Moonshot / Kimi (USD per MILLION tokens; no cache-write tier) ───────────
-	// Kimi bills in USD on platform.kimi.ai. Listed per model, NOT as a generic
-	// "kimi" family: k3 and the k2.x line differ by 5×, so a family fallback would
-	// price a future model by coincidence. Same rule OpenAI/Anthropic follow above.
+	// ── Moonshot / Kimi (CNY per MILLION tokens; no cache-write tier) ───────────
+	// Moonshot publishes TWO lists for the same model — ¥20/¥100 per 1M on
+	// platform.moonshot.cn and $3.00/$15.00 on platform.kimi.ai, the same price at
+	// its own 6.67 conversion. CNY is the one used, because that is the platform
+	// billed against here; catalog.go carries the USD list alongside so a surface
+	// can show both without this package ever holding an exchange rate.
+	//
+	// Listed per model, NOT as a generic "kimi" family: k3 and the k2.x line differ
+	// several-fold, so a family fallback would price a future model by coincidence.
 	// "k3" is the bare id codex records; "kimi-k3" is the canonical one.
-	{"kimi-k3", ModelPrice{Tier: Tier{3, 15, 0.30, 0, 0}, Currency: "USD"}},
-	{"k3", ModelPrice{Tier: Tier{3, 15, 0.30, 0, 0}, Currency: "USD"}},
-	{"kimi-k2.5", ModelPrice{Tier: Tier{0.6, 3, 0.1, 0, 0}, Currency: "USD"}},
+	//
+	// The k2.x line is deliberately absent: its CNY list price has not been
+	// verified, and upstream's USD figure cannot be borrowed for it — one vendor,
+	// two currencies is the split this whole file exists to prevent.
+	{"kimi-k3", ModelPrice{Tier: Tier{20, 100, 2, 0, 0}, Currency: "CNY"}},
+	{"k3", ModelPrice{Tier: Tier{20, 100, 2, 0, 0}, Currency: "CNY"}},
 
 	// ── DeepSeek (USD per MILLION tokens; no cache-write tier) ──────────────────
 	// Was a single generic "deepseek" key at CNY {1, 2, 0.1} — a V3-era number that

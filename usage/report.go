@@ -110,6 +110,14 @@ type ProviderRow struct {
 	// is the only handle the user has on what they were actually running, so it is never omitted
 	// there.
 	TopModel string `json:"top_model,omitempty"`
+	// UnitPrices are the published rate cards for TopModel, the one the money was computed with
+	// first. It exists because a currency SYMBOL is not evidence: Moonshot sells kimi-k3 at both
+	// ¥20/M and $3.00/M, and a bare「$85.93」gives the reader no way to tell which list produced
+	// it — while being wrong by 6.67× still looks entirely plausible.
+	//
+	// Describes TopModel only. A row mixing several models states the unit price of its largest
+	// contributor, which is a claim about that model, not about the row's total.
+	UnitPrices []pricing.RateCard `json:"unit_prices,omitempty"`
 	// Spark is the per-day total-token trend for this row (oldest-first).
 	Spark []int64 `json:"spark"`
 }

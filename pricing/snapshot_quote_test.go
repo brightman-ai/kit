@@ -11,7 +11,9 @@ import (
 // A model upstream publishes and no human ever typed is now priceable. Before this hop, 289
 // generated ids were unreachable from request pricing and every one of them rendered「—」.
 func TestQuoteFromSnapshot_ReachesTheGeneratedTable(t *testing.T) {
-	for _, model := range []string{"o4-mini", "chatgpt-4o-latest", "kimi-k2.6"} {
+	// NOT a moonshot model: upstream carries Moonshot's international USD list and this codebase
+	// prices Moonshot in CNY, so the generator deliberately excludes that vendor entirely.
+	for _, model := range []string{"o4-mini", "chatgpt-4o-latest", "mistral-large-latest"} {
 		if _, ok := DefaultCatalog().Quote(RequestQuery{Model: model, At: time.Now(), ServiceTier: "standard"}); ok {
 			t.Fatalf("%s is now in the hand catalog — pick a generated-only model for this test", model)
 		}

@@ -55,10 +55,13 @@ const upstreamURL = "https://raw.githubusercontent.com/BerriAI/litellm/main/mode
 // resale rate is not Moonshot's list price. Letting one through would file money
 // under a vendor heading that is simply false.
 //
-// dashscope (qwen) is deliberately ABSENT even though it is first-party: table.go
-// prices qwen in CNY, upstream quotes USD, and mixing them would put two currencies
-// under one vendor — which TestOneCurrencyPerVendor exists to forbid, because a
-// vendor row that spans currencies has no computable total.
+// dashscope (qwen) and moonshot (kimi) are deliberately ABSENT even though both are
+// first-party. Upstream carries their INTERNATIONAL list, in USD; this codebase
+// prices them from the DOMESTIC list, in CNY, because that is the platform actually
+// billed against. Both numbers are real — Moonshot sells kimi-k3 at ¥20/M and
+// $3.00/M for the same tokens — but a vendor whose rows span two currencies has no
+// computable total, which is the defect the vendor axis exists to fix.
+// TestOneCurrencyPerVendor fails the build if either is let back in.
 //
 // The VALUE is our canonical vendor id, which is not always upstream's provider
 // name: upstream says "gemini" (a product) where we say "google" (the biller).
@@ -67,7 +70,6 @@ var firstPartyProviders = map[string]string{
 	"openai":    "openai",
 	"gemini":    "google",
 	"deepseek":  "deepseek",
-	"moonshot":  "moonshot",
 	"xai":       "xai",
 	"mistral":   "mistral",
 	"minimax":   "minimax",

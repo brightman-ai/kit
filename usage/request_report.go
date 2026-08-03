@@ -136,7 +136,8 @@ func BuildRequestReport(window WindowKind, timezone string, now time.Time, facts
 			InputTokens: a.in, OutputTokens: a.out,
 			CacheReadTokens: a.read, CacheCreateTokens: a.write,
 			TotalTokens: a.in + a.out + a.read + a.write, TopModel: topKey(a.byModel),
-			Requests: a.requests, PricedRequests: a.priced,
+			UnitPrices: pricing.PublishedRates(topKey(a.byModel)),
+			Requests:   a.requests, PricedRequests: a.priced,
 			Spark: requestDaySpark(start, days, a.byDay), Costs: roundedCosts(a.costs),
 		}
 		if !a.priceVerifiedAt.IsZero() {

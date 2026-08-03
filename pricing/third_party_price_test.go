@@ -14,9 +14,13 @@ func TestThirdPartyPricesArePinned(t *testing.T) {
 		in, out, cacheRead float64
 		currency           string
 	}{
-		// Moonshot: $3.00 cache-miss in / $15.00 out / $0.30 cache-hit per 1M (ex-tax).
-		{"kimi-k3", 3, 15, 0.30, "USD"},
-		{"k3", 3, 15, 0.30, "USD"},
+		// Moonshot, DOMESTIC list (platform.moonshot.cn): ¥20.00 cache-miss in /
+		// ¥100.00 out / ¥2.00 cache-hit per 1M. The international list ($3.00/$15.00/
+		// $0.30 on platform.kimi.ai) is the same price at Moonshot's own 6.67
+		// conversion and rides along in alsoPublishedAs — see
+		// TestKimiPublishesBothListsAndNeitherIsAnFXConversion.
+		{"kimi-k3", 20, 100, 2, "CNY"},
+		{"k3", 20, 100, 2, "CNY"},
 		// DeepSeek: agrees digit-for-digit with LiteLLM's snapshot.
 		{"deepseek-v4-flash", 0.14, 0.28, 0.0028, "USD"},
 		{"deepseek-v4-pro", 0.435, 0.87, 0.003625, "USD"},
@@ -72,5 +76,50 @@ func TestThirdPartyQuoteVerifiedRecently(t *testing.T) {
 	if !quote.VerifiedAt.After(catalogSnapshotDate) {
 		t.Errorf("k3 VerifiedAt = %s, expected to be newer than the bulk snapshot %s",
 			quote.VerifiedAt.Format(time.DateOnly), catalogSnapshotDate.Format(time.DateOnly))
+	}
+}
+
+// Moonshot sells the same model on two platforms at two list prices. Both are published numbers,
+// and the gap between them (6.67×) is exactly the size of error that looks plausible on screen —
+// which is why the surface shows both instead of picking one and hoping.
+//
+// The invariant that matters: the second card is a SECOND PUBLISHED PRICE, never a converted one.
+// If anyone ever "helpfully" derives it with an exchange rate, this test is what should stop them —
+// an FX rate is a third fact, with its own source and its own staleness, and this package holds no
+// such thing.
+func TestKimiPublishesBothListsAndNeitherIsAnFXConversion(t *testing.T) {
+	cards := PublishedRates("k3")
+	if len(cards) != 2 {
+		t.Fatalf("k3 has %d rate cards, want 2 (domestic + international)", len(cards))
+	}
+	primary, alt := cards[0], cards[1]
+	if !primary.Primary || alt.Primary {
+		t.Errorf("exactly the first card must be marked primary: %+v / %+v", primary, alt)
+	}
+	if primary.Currency != "CNY" || primary.InputPerM != 20 || primary.OutputPerM != 100 || primary.CacheReadPerM != 2 {
+		t.Errorf("primary card = %+v, want the domestic CNY list ¥20/¥100/¥2", primary)
+	}
+	if alt.Currency != "USD" || alt.InputPerM != 3 || alt.OutputPerM != 15 || alt.CacheReadPerM != 0.30 {
+		t.Errorf("alternate card = %+v, want the international USD list $3/$15/$0.30", alt)
+	}
+	// Each card names the page it was read from, so neither can be mistaken for a derived number.
+	for _, c := range cards {
+		if c.SourceURL == "" {
+			t.Errorf("%s card has no source page", c.Currency)
+		}
+	}
+	if primary.SourceURL == alt.SourceURL {
+		t.Error("both cards cite the same page — one of them is not actually a separate publication")
+	}
+}
+
+// A model with one published list reports one card, not a padded pair.
+func TestPublishedRates_SingleListStaysSingle(t *testing.T) {
+	cards := PublishedRates("claude-opus-5")
+	if len(cards) != 1 || cards[0].Currency != "USD" || !cards[0].Primary {
+		t.Errorf("claude-opus-5 rate cards = %+v, want exactly one primary USD card", cards)
+	}
+	if cards := PublishedRates("zzz-unknown-1"); len(cards) != 0 {
+		t.Errorf("an unpriced model reported rate cards: %+v", cards)
 	}
 }
