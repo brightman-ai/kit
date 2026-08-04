@@ -127,3 +127,37 @@ func TestShapeBRequiresADeclaredParent(t *testing.T) {
 		t.Fatalf("got %d facts, want 1 — an unforked rollout's early usage is its own", len(facts))
 	}
 }
+
+// A fork inherits its parent's CONFIGURATION and does not inherit its parent's spend. Skipping the
+// copied block wholesale discarded both, and the configuration is the half that matters: codex
+// records service_tier only in `thread_settings_applied`, which a resumed or forked thread never
+// re-emits. For those rollouts the copied block is the ONLY place the billing tier appears, so
+// dropping it left every request in the file unpriced.
+func TestForkInheritsConfigurationButNotSpend(t *testing.T) {
+	const body = `{"timestamp":"2026-07-29T18:42:59.427Z","type":"session_meta","payload":{"id":"019faf2f-e3a2-7711-a2bd-c36089627192","forked_from_id":"019f9d9c-adfe-7852-8c4f-9d4c94e4c84c"}}
+{"timestamp":"2026-07-29T18:42:59.428Z","type":"session_meta","payload":{"id":"019f9d9c-adfe-7852-8c4f-9d4c94e4c84c"}}
+{"timestamp":"2026-07-29T18:42:59.429Z","type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"model":"gpt-5.6-sol","service_tier":"priority","reasoning_effort":"xhigh"}}}
+{"timestamp":"2026-07-29T18:42:59.430Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":900000,"output_tokens":5000,"total_tokens":905000}}}}
+{"timestamp":"2026-07-29T18:42:59.470Z","type":"event_msg","payload":{"type":"task_started","turn_id":"019faf2f-f000-7000-8000-000000000000"}}
+{"timestamp":"2026-07-29T19:23:31.444Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":300,"output_tokens":10,"total_tokens":310}}}}
+`
+	facts := scanCodexFixture(t, "inherit.jsonl", body)
+	if len(facts) != 1 {
+		t.Fatalf("got %d facts, want 1 — only the child's own request", len(facts))
+	}
+	f := facts[0]
+	if f.InputTokens != 300 {
+		t.Errorf("spend crossed the boundary: input=%d, want the child's own 300", f.InputTokens)
+	}
+	// ...and the settings did cross it. Without this the request is unpriced, because the child
+	// never declares a tier of its own.
+	if f.ServiceTier != "priority" {
+		t.Errorf("ServiceTier=%q, want priority inherited from the copied block", f.ServiceTier)
+	}
+	if f.Model != "gpt-5.6-sol" {
+		t.Errorf("Model=%q, want gpt-5.6-sol inherited from the copied block", f.Model)
+	}
+	if f.Effort != "xhigh" {
+		t.Errorf("Effort=%q, want xhigh inherited from the copied block", f.Effort)
+	}
+}

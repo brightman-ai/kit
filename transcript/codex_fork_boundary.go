@@ -48,15 +48,62 @@ import (
 //
 // A file with neither shape returns 0 — an ordinary rollout is read whole.
 
-// CodexOwnStartOffset returns the byte offset where a forked/subagent rollout's own events begin.
+// CodexOwnStart returns a cursor positioned where a forked rollout's own work begins, carrying
+// the CONFIGURATION it inherited.
 //
-// It returns an error rather than 0 when a fork's boundary cannot be found: silently reading such
-// a file from the top would double-count thousands of requests, and a loud failure that skips one
-// file is much cheaper than a quiet one that inflates the bill.
+// The distinction is the point: a fork inherits its parent's settings and does not inherit its
+// parent's spend. Skipping the copied block wholesale discards both, and the settings are the
+// half we need — codex records service_tier only in `thread_settings_applied`, which a resumed or
+// forked thread never re-emits, so for those rollouts the copied block is the ONLY place the
+// billing tier appears. Dropping it left every request in the file unpriced with no way to tell
+// why.
+//
+// Only fields that describe how the thread is configured are carried: model, tier, effort,
+// provider. Nothing about what the parent spent crosses the boundary.
+func CodexOwnStart(path, sessionID string) (CodexRequestCursor, error) {
+	offset, inherited, err := codexOwnStartOffset(path, sessionID)
+	if err != nil {
+		return CodexRequestCursor{}, err
+	}
+	cursor := CodexRequestCursor{Offset: offset}
+	if offset > 0 {
+		// Past the boundary the child's own session_meta is behind us, so the identity it would
+		// have supplied is seeded here along with the inherited configuration.
+		cursor.SessionID = sessionID
+		cursor.Provider = firstNonEmptyString(inherited.provider, "openai")
+		cursor.Model = inherited.model
+		cursor.ServiceTier = inherited.tier
+		cursor.Speed = inherited.speed
+		cursor.BillingMode = inherited.billing
+		cursor.Effort = inherited.effort
+	}
+	return cursor, nil
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// inheritedConfig is the thread configuration observed inside the copied parent block.
+type inheritedConfig struct{ model, tier, speed, billing, effort, provider string }
+
+// CodexOwnStartOffset returns just the byte offset. Prefer CodexOwnStart, which also recovers the
+// configuration the fork inherited.
 func CodexOwnStartOffset(path, sessionID string) (int64, error) {
+	offset, _, err := codexOwnStartOffset(path, sessionID)
+	return offset, err
+}
+
+func codexOwnStartOffset(path, sessionID string) (int64, inheritedConfig, error) {
+	var cfg inheritedConfig
 	f, err := os.Open(path)
 	if err != nil {
-		return 0, err
+		return 0, cfg, err
 	}
 	defer f.Close()
 
@@ -81,6 +128,14 @@ func CodexOwnStartOffset(path, sessionID string) (int64, error) {
 					ForkedFromID   string          `json:"forked_from_id"`
 					ParentThreadID string          `json:"parent_thread_id"`
 					Source         json.RawMessage `json:"source"`
+					ModelProvider  string          `json:"model_provider_id"`
+					Model          string          `json:"model"`
+					Settings       struct {
+						Model           string `json:"model"`
+						ModelProviderID string `json:"model_provider_id"`
+						ServiceTier     string `json:"service_tier"`
+						ReasoningEffort string `json:"reasoning_effort"`
+					} `json:"thread_settings"`
 				} `json:"payload"`
 			}
 			if json.Unmarshal(line, &row) == nil {
@@ -94,7 +149,7 @@ func CodexOwnStartOffset(path, sessionID string) (int64, error) {
 				if inherited && row.Type == "event_msg" && row.Payload.Type == "task_started" && validSessionID {
 					if taskMillis, ok := uuidV7Millis(row.Payload.TurnID); ok &&
 						taskMillis >= sessionMillis && taskMillis-sessionMillis <= int64((10*time.Minute)/time.Millisecond) {
-						return lineStart, nil // shape A
+						return lineStart, cfg, nil // shape A
 					}
 				}
 				if firstDeclaration < 0 && (row.Type == "turn_context" || row.Payload.Type == "thread_settings_applied") {
@@ -103,22 +158,37 @@ func CodexOwnStartOffset(path, sessionID string) (int64, error) {
 				if firstDeclaration < 0 && row.Payload.Type == "token_count" {
 					usageBeforeDeclaration = true
 				}
+				// Configuration seen anywhere in the copied block is INHERITED, so it is kept even
+				// though the usage beside it is discarded. This is the only place a resumed or
+				// forked thread's service_tier ever appears.
+				if row.Payload.Type == "thread_settings_applied" {
+					st := row.Payload.Settings
+					cfg.model = firstNonEmptyString(st.Model, cfg.model)
+					cfg.provider = firstNonEmptyString(st.ModelProviderID, cfg.provider)
+					cfg.effort = firstNonEmptyString(st.ReasoningEffort, cfg.effort)
+					if st.ServiceTier != "" {
+						cfg.tier, cfg.speed, cfg.billing = codexTierAndSpeed(st.ServiceTier)
+					}
+				}
+				if row.Type == "turn_context" && row.Payload.Model != "" {
+					cfg.model = firstNonEmptyString(cfg.model, row.Payload.Model)
+				}
 			}
 		}
 		if readErr != nil {
 			if readErr == io.EOF {
 				break
 			}
-			return 0, readErr
+			return 0, cfg, readErr
 		}
 	}
 	if inherited {
-		return 0, fmt.Errorf("codex child boundary not found: %s", filepath.Base(path))
+		return 0, cfg, fmt.Errorf("codex child boundary not found: %s", filepath.Base(path))
 	}
 	if forked && usageBeforeDeclaration && firstDeclaration > 0 {
-		return firstDeclaration, nil // shape B
+		return firstDeclaration, cfg, nil // shape B
 	}
-	return 0, nil
+	return 0, cfg, nil
 }
 
 // hasSubagentSource reports whether a session_meta's `source` names a subagent spawn — the shape

@@ -337,20 +337,14 @@ func (u ModelRequestUsage) ContextTokens() int64 {
 func ScanCodexRequestUsage(path string) ([]ModelRequestUsage, error) {
 	cursor := CodexRequestCursor{}
 	if sessionID := codexRolloutSessionID(path); sessionID != "" {
-		offset, err := CodexOwnStartOffset(path, sessionID)
+		seeded, err := CodexOwnStart(path, sessionID)
 		if err != nil {
 			// A fork whose boundary cannot be found is skipped rather than read whole: reading it
 			// would silently double-count the parent's entire history, and a missing file is far
 			// easier to notice than an inflated total.
 			return nil, err
 		}
-		cursor.Offset = offset
-		if offset > 0 {
-			// Past the inherited block the child's own session_meta is behind us, so seed the
-			// identity the scan would otherwise have read from it.
-			cursor.SessionID = sessionID
-			cursor.Provider = "openai"
-		}
+		cursor = seeded
 	}
 	facts, _, err := ScanCodexRequestUsageIncremental(path, cursor)
 	return facts, err
