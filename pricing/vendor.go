@@ -170,9 +170,34 @@ func VendorForModel(model string) Vendor {
 		}
 	}
 	for _, e := range sortedVendorTable {
-		if m == e.key || strings.HasPrefix(m, e.key+"-") {
+		if matchesVendorFamily(m, e.key) {
 			return e.vendor
 		}
 	}
 	return VendorUnknown
+}
+
+// matchesVendorFamily accepts a family stem followed by a separator OR a digit.
+//
+// The digit case is not a nicety — it is how these vendors actually name things. Alibaba ships
+// `qwen3.8-max` and `qwen3.7-plus`, with no separator at all between the family and its version,
+// so a dash-only rule silently loses every current Qwen model to 未知厂商 while happily resolving
+// the discontinued `qwen-max`. The same shape shows up as gpt4 / claude3 / grok4 elsewhere.
+//
+// This is looser than the PRICE matcher on purpose, and the asymmetry is the whole design: a
+// family guess on the vendor puts a row under a heading, where being wrong is visible and costs a
+// label. A family guess on the price invents money, where being wrong is invisible.
+func matchesVendorFamily(model, key string) bool {
+	if model == key {
+		return true
+	}
+	if !strings.HasPrefix(model, key) {
+		return false
+	}
+	switch next := model[len(key)]; {
+	case next == '-', next == '.', next == '_', next == '/':
+		return true
+	default:
+		return next >= '0' && next <= '9'
+	}
 }

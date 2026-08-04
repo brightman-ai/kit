@@ -117,3 +117,30 @@ func TestOneCurrencyPerVendor(t *testing.T) {
 		}
 	}
 }
+
+// Vendors do not all put a separator between a family and its version. Alibaba ships
+// `qwen3.8-max`; a dash-only rule resolves the DISCONTINUED `qwen-max` and loses every model
+// anyone actually runs today. The same shape appears as gpt4 / claude3 / grok4.
+func TestVendorFamilyMatchesDigitSuffixedNames(t *testing.T) {
+	cases := map[string]Vendor{
+		"qwen3.8-max":  VendorAlibaba,
+		"qwen3.7-plus": VendorAlibaba,
+		"qwen-max":     VendorAlibaba,
+		"glm-5.2":      VendorZhipu,
+		"grok4":        VendorXAI,
+		"claude3-opus": VendorAnthropic,
+		"k3":           VendorMoonshot,
+	}
+	for model, want := range cases {
+		if got := VendorForModel(model); got != want {
+			t.Errorf("VendorForModel(%q) = %+v, want %+v", model, got, want)
+		}
+	}
+	// The looseness must stop at a word boundary — a different word that merely starts the same
+	// way is not this vendor's model.
+	for _, model := range []string{"qwenstein", "glmx", "grokking"} {
+		if v := VendorForModel(model); v.Known() {
+			t.Errorf("VendorForModel(%q) = %+v, want unknown — the stem must end at a boundary", model, v)
+		}
+	}
+}

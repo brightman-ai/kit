@@ -98,10 +98,21 @@ var priceTable = []priceEntry{
 	{"deepseek-v4-pro", ModelPrice{Tier: Tier{0.435, 0.87, 0.003625, 0, 0}, Currency: "USD"}},
 	{"deepseek-chat", ModelPrice{Tier: Tier{0.28, 0.42, 0.028, 0, 0}, Currency: "USD"}},
 
-	// ── Other Chinese vendors (CNY per MILLION tokens; no cache tier) ───────────
-	// Official vendor list prices. Currency is CNY — Cost() returns CNY for these.
-	{"glm-4-flash", ModelPrice{Tier: Tier{0.1, 0.1, 0, 0, 0}, Currency: "CNY"}},
-	{"glm", ModelPrice{Tier: Tier{5, 5, 0, 0, 0}, Currency: "CNY"}},
-	{"qwen-max", ModelPrice{Tier: Tier{2.4, 9.6, 0, 0, 0}, Currency: "CNY"}},
-	{"qwen", ModelPrice{Tier: Tier{0.8, 2, 0, 0, 0}, Currency: "CNY"}},
+	// ── Zhipu / GLM (CNY per MILLION tokens; no cache-write tier) ───────────────
+	// open.bigmodel.cn/pricing, read 2026-08-05. Exact ids only — the generic "glm"
+	// key that used to sit here was a family fallback at ¥5/¥5 whose output rate was
+	// 5.6× under the current flagship, and being generic it would have applied that
+	// to every future GLM. Same rule OpenAI and Anthropic follow above, same reason.
+	{"glm-5.2", ModelPrice{Tier: Tier{8, 28, 2, 0, 0}, Currency: "CNY"}},
+	{"glm-5.1", ModelPrice{Tier: Tier{6, 24, 1.3, 0, 0}, Currency: "CNY"}},
+
+	// ── Removed rather than left stale ─────────────────────────────────────────
+	// "qwen" / "qwen-max" carried ¥0.8/¥2 and ¥2.4/¥9.6 from an unrecorded vintage,
+	// and Alibaba's line has since moved to qwen3.8-max / qwen3.7-plus / qwen3.7-flash
+	// — the ids those keys priced are no longer the models anyone runs. No current
+	// figure was verifiable at the time of writing, so they are gone: a qwen request
+	// now resolves to its vendor and shows「无价表」, which is a question the reader
+	// can act on. A stale number is one they cannot even see is wrong.
+	// "glm-4-flash" went the same way; upstream now lists that line as free, which is
+	// a different claim from ¥0.1 and not one to guess at.
 }

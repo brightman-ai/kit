@@ -123,3 +123,45 @@ func TestPublishedRates_SingleListStaysSingle(t *testing.T) {
 		t.Errorf("an unpriced model reported rate cards: %+v", cards)
 	}
 }
+
+// GLM, read off open.bigmodel.cn/pricing. Pinned like the ccusage anchors: a price is a claim
+// about someone else's invoice and does not get to drift because a refactor swept through.
+func TestGLMPricesArePinned(t *testing.T) {
+	at := mustDate("2026-08-01")
+	for _, tc := range []struct {
+		model              string
+		in, out, cacheRead float64
+	}{
+		{"glm-5.2", 8, 28, 2},
+		{"glm-5.1", 6, 24, 1.3},
+	} {
+		price, ok := LookupAt(tc.model, at, "standard")
+		if !ok {
+			t.Errorf("%s: no price", tc.model)
+			continue
+		}
+		if price.InputPerM != tc.in || price.OutputPerM != tc.out || price.CacheReadPerM != tc.cacheRead {
+			t.Errorf("%s: got %v/%v/%v, want %v/%v/%v", tc.model,
+				price.InputPerM, price.OutputPerM, price.CacheReadPerM, tc.in, tc.out, tc.cacheRead)
+		}
+		if price.Currency != "CNY" {
+			t.Errorf("%s: currency %q, want CNY", tc.model, price.Currency)
+		}
+	}
+}
+
+// The family fallbacks are gone on purpose. An unknown GLM or Qwen must stay unpriced rather than
+// inherit a neighbour's rate — the same rule OpenAI and Anthropic have always followed here, and
+// the reason the old generic "glm" key was wrong by 5.6× on output without anyone noticing.
+func TestNoFamilyFallbackForChineseVendors(t *testing.T) {
+	for _, model := range []string{"glm-9-imaginary", "qwen-max", "qwen3.8-max", "qwen-imaginary"} {
+		if price, ok := Lookup(model); ok {
+			t.Errorf("%s was priced at %+v; an unverified model must stay unpriced", model, price)
+		}
+		// Still attributable, though: the money shows up under its vendor with「无价表」rather
+		// than vanishing into the unknown bucket.
+		if v := VendorForModel(model); !v.Known() {
+			t.Errorf("%s lost its vendor as well as its price", model)
+		}
+	}
+}

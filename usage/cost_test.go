@@ -27,10 +27,18 @@ func TestComputeCost_KnownModels(t *testing.T) {
 		t.Fatalf("haiku total = %v, want 6", h.TotalCost)
 	}
 
-	// glm is a CNY-priced model in the SSOT (Chinese vendor list price): 1M input × ¥5/M = ¥5.
-	g := ComputeCost("glm-4.7", 1_000_000, 0, 0, 0)
-	if !g.HasPrice || g.Currency != "CNY" || g.TotalCost != 5 {
-		t.Fatalf("glm should be CNY-priced (¥5 for 1M input), got %+v", g)
+	// GLM is CNY-priced, and only for ids actually published: 1M input × ¥8/M = ¥8.
+	g := ComputeCost("glm-5.2", 1_000_000, 0, 0, 0)
+	if !g.HasPrice || g.Currency != "CNY" || g.TotalCost != 8 {
+		t.Fatalf("glm-5.2 should be CNY-priced (¥8 for 1M input), got %+v", g)
+	}
+
+	// An unlisted GLM stays unpriced. This assertion used to run the other way — glm-4.7 was
+	// priced at ¥5 by a generic "glm" family key whose output rate was 5.6× under the current
+	// flagship. Being generic is what let it be wrong about every model at once, so the family
+	// key is gone and this is now the contract: unknown id ⟹ no price, and the report says so.
+	if u := ComputeCost("glm-4.7", 1_000_000, 0, 0, 0); u.HasPrice {
+		t.Fatalf("glm-4.7 has no published price here and must stay unpriced, got %+v", u)
 	}
 }
 
