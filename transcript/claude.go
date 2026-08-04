@@ -36,14 +36,30 @@ func NewClaudeSource() *ClaudeSource {
 func (s *ClaudeSource) Kind() string { return KindClaude }
 
 // EncodeProjectDir maps an absolute project dir to claude's directory name.
-// claude collapses BOTH '/' and '.' to '-', so `/home/u/.deepwork/ws` becomes
-// `-home-u--deepwork-ws` (the '/.' → '--'). Encoding only '/' was a latent bug:
-// it worked for dot-free paths (…/my-project) but pointed at a non-existent
-// shard for any dotted path (…/.deepwork/…) — which broke session reads AND the
-// collaborate jail's RW bind of that shard (jailed agent could not persist its turn).
+//
+// claude collapses '/', '.' AND '_' to '-', so `/home/u/.deepwork/my_ws` becomes
+// `-home-u--deepwork-my-ws` (the '/.' → '--'). Each character was learned the same
+// way — by a path that silently pointed at a shard that does not exist:
+//
+//	'/' only  — worked for plain paths, broke every dotted one (…/.deepwork/…),
+//	            taking session reads and the collaborate jail's RW bind with it.
+//	'_'       — broke every path with an underscore. A tmux pane in
+//	            …/update_discourse_cert could not find its own transcript, so the
+//	            monitor fell back to "cannot locate ⟹ assume busy" and pinned the
+//	            pane green forever, with no age to contradict it.
+//
+// Verified mechanically against a live ~/.claude/projects rather than inferred:
+// over every shard there whose transcript records a cwd, replacing '/', '.' and '_'
+// reproduces 9 of 9 directory names; replacing only '/' and '.' reproduces 6 — and
+// the three misses are exactly the paths containing an underscore.
+// TestEncodeProjectDirRealWorldShards pins those cases.
+//
+// This is lossy and deliberately so: it must match claude's own naming, not be
+// reversible. Two different paths CAN collide onto one shard (a_b and a-b), which is
+// claude's behaviour to own, not ours to correct — guessing a different directory
+// than claude writes to is how the bugs above happened in the first place.
 func EncodeProjectDir(projectDir string) string {
-	r := strings.ReplaceAll(projectDir, "/", "-")
-	return strings.ReplaceAll(r, ".", "-")
+	return strings.NewReplacer("/", "-", ".", "-", "_", "-").Replace(projectDir)
 }
 
 // projectDirPath returns the encoded claude project directory for projectDir.
