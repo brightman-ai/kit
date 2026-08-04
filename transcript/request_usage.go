@@ -324,8 +324,35 @@ func (u ModelRequestUsage) ContextTokens() int64 {
 // ScanCodexRequestUsage projects every event_msg/token_count.last_token_usage
 // into one request fact. Source offset is a stable append-only identity when the
 // wire does not expose a provider request id.
+// ScanCodexRequestUsage reads a whole rollout, starting where that rollout's OWN work starts.
+//
+// For a forked or subagent rollout that means skipping the parent conversation codex copies in as
+// context — see CodexOwnStartOffset. Doing it HERE, rather than leaving it to each caller, is the
+// point: a caller who forgets does not get an error, it gets a plausible number that is several
+// times too large. A local 7-day window read the naive way reported 56,873 codex requests where
+// 6,975 were the child's own, and nothing about the output looked wrong.
+//
+// Callers that resume incrementally must still supply the offset themselves — they own the cursor,
+// and re-deriving it on every append would defeat the point of having one.
 func ScanCodexRequestUsage(path string) ([]ModelRequestUsage, error) {
-	facts, _, err := ScanCodexRequestUsageIncremental(path, CodexRequestCursor{})
+	cursor := CodexRequestCursor{}
+	if sessionID := codexRolloutSessionID(path); sessionID != "" {
+		offset, err := CodexOwnStartOffset(path, sessionID)
+		if err != nil {
+			// A fork whose boundary cannot be found is skipped rather than read whole: reading it
+			// would silently double-count the parent's entire history, and a missing file is far
+			// easier to notice than an inflated total.
+			return nil, err
+		}
+		cursor.Offset = offset
+		if offset > 0 {
+			// Past the inherited block the child's own session_meta is behind us, so seed the
+			// identity the scan would otherwise have read from it.
+			cursor.SessionID = sessionID
+			cursor.Provider = "openai"
+		}
+	}
+	facts, _, err := ScanCodexRequestUsageIncremental(path, cursor)
 	return facts, err
 }
 
