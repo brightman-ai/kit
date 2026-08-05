@@ -410,8 +410,16 @@ func ScanCodexRequestUsageIncremental(path string, cursor CodexRequestCursor) ([
 			if json.Unmarshal(trimmed, &line) == nil {
 				switch line.Type {
 				case "session_meta":
-					if meta := line.asSessionMeta(); meta != nil && meta.ID != "" {
-						sessionID = meta.ID
+					if meta := line.asSessionMeta(); meta != nil {
+						if meta.ID != "" {
+							sessionID = meta.ID
+						}
+						// The thread's own declaration of where it runs. A `codex exec` rollout
+						// states it here and nowhere else, so without this its facts inherited a
+						// default instead of the truth.
+						if meta.ModelProvider != "" {
+							provider = meta.ModelProvider
+						}
 					}
 				case "turn_context":
 					if tc := line.asTurnContext(); tc != nil {
@@ -521,9 +529,11 @@ func ScanCodexRequestUsageIncremental(path string, cursor CodexRequestCursor) ([
 								Timing: CoveragePartial, CacheTTL: CoverageComplete},
 							Diagnostics: diag,
 						}
-						if provider == "" {
-							fact.Provider = "openai"
-						}
+						// No default. Codex rollouts state their provider in session_meta or in
+						// thread_settings_applied; when neither does, the honest record is empty.
+						// Stamping "openai" made a kimi run look like an OpenAI one — a field that
+						// contradicts the model beside it, and exactly the kind of quiet wrong
+						// answer that survives review because it is usually right.
 						if fact.StartedAt == nil {
 							fact.Diagnostics = appendUnique(fact.Diagnostics, "response_start_missing")
 						}

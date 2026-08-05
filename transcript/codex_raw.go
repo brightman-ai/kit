@@ -29,6 +29,15 @@ type codexSessionMeta struct {
 	ID        string `json:"id"`
 	Timestamp string `json:"timestamp"`
 	Cwd       string `json:"cwd"`
+	// ModelProvider is the provider this thread was started against, written by codex at session
+	// start. It is the ONLY provider evidence a `codex exec` run leaves — such a rollout emits no
+	// thread_settings_applied at all, and reading only that event is how 61 local rollouts ended
+	// up with a hardcoded "openai" stamped over what was actually kimi.
+	//
+	// Still a user-chosen routing alias, not a vendor identity (pricing.VendorForModel documents
+	// why the vendor axis reads the model id instead). Recorded because a field the transcript
+	// actually states beats a default that contradicts it.
+	ModelProvider string `json:"model_provider"`
 }
 
 // codexMessage is a response_item payload of type=message. role is

@@ -161,3 +161,39 @@ func TestForkInheritsConfigurationButNotSpend(t *testing.T) {
 		t.Errorf("Effort=%q, want xhigh inherited from the copied block", f.Effort)
 	}
 }
+
+// A `codex exec` rollout states its provider in session_meta and emits no
+// thread_settings_applied at all. Reading only the latter left 61 local rollouts with a hardcoded
+// "openai" stamped over what was actually kimi — a field contradicting the model beside it.
+func TestCodexExecProviderComesFromSessionMeta(t *testing.T) {
+	const body = `{"timestamp":"2026-08-04T18:48:16.940Z","type":"session_meta","payload":{"id":"019fce1a-e510-7ed1-9dc2-d8ad23ed3c3a","originator":"codex_exec","source":"exec","model_provider":"kimi","history_mode":"legacy"}}
+{"timestamp":"2026-08-04T18:48:17.000Z","type":"turn_context","payload":{"model":"k3","effort":"high"}}
+{"timestamp":"2026-08-04T18:48:20.000Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":1000,"output_tokens":50,"total_tokens":1050}}}}
+`
+	facts := scanCodexFixture(t, "exec.jsonl", body)
+	if len(facts) != 1 {
+		t.Fatalf("got %d facts, want 1", len(facts))
+	}
+	if facts[0].Provider != "kimi" {
+		t.Errorf("Provider=%q, want kimi as session_meta states — never a default", facts[0].Provider)
+	}
+	if facts[0].Model != "k3" {
+		t.Errorf("Model=%q, want k3", facts[0].Model)
+	}
+}
+
+// When nothing states a provider, the record stays EMPTY. An unproven field must not be filled in
+// with the common case: "usually openai" is how a wrong answer gets past review.
+func TestCodexProviderIsNeverDefaulted(t *testing.T) {
+	const body = `{"timestamp":"2026-08-04T18:00:00.000Z","type":"session_meta","payload":{"id":"019fce1a-e510-7ed1-9dc2-d8ad23ed3c3a"}}
+{"timestamp":"2026-08-04T18:00:01.000Z","type":"turn_context","payload":{"model":"k3"}}
+{"timestamp":"2026-08-04T18:00:02.000Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"output_tokens":1,"total_tokens":11}}}}
+`
+	facts := scanCodexFixture(t, "noprovider.jsonl", body)
+	if len(facts) != 1 {
+		t.Fatalf("got %d facts, want 1", len(facts))
+	}
+	if facts[0].Provider != "" {
+		t.Errorf("Provider=%q, want empty — nothing in the transcript states one", facts[0].Provider)
+	}
+}
