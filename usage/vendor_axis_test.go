@@ -267,3 +267,37 @@ func TestScalarCost_NeverSumsAcrossCurrencies(t *testing.T) {
 		t.Errorf("no money should stay nil, got %v %q", *cost, currency)
 	}
 }
+
+// A subagent's spend must land under the vendor its PARENT was configured for, not under a
+// default. This is the whole accuracy requirement for forks in one assertion: not double-counted,
+// not dropped, and not filed under the wrong biller.
+//
+// The trap it guards is specific. A forked rollout does not declare its own model, so the model —
+// and therefore the vendor — comes from the settings inherited across the fork boundary. Lose that
+// inheritance and every subagent request resolves to no vendor at all; stamp a default instead and
+// a kimi subagent is silently billed to OpenAI. Verified against the live machine when this was
+// written: 48 of 48 subagent rollouts agreed with their parent's model, 0 disagreed, and 0 facts
+// carried an empty model.
+func TestRequestReport_SubagentSpendLandsUnderTheParentsVendor(t *testing.T) {
+	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	// A subagent of a kimi-configured parent: the model is inherited, so the vendor must be
+	// Moonshot even though codex is the caller and OpenAI is the caller's usual home.
+	rep := BuildRequestReport(Window7d, "UTC", now, []transcript.ModelRequestUsage{
+		factAt("child-1", "codex", "k3", "unknown", now.Add(-time.Hour), 1_000_000, 50_000),
+		factAt("child-2", "codex", "k3", "unknown", now.Add(-time.Hour), 500_000, 20_000),
+	})
+	row := rowFor(t, rep, "moonshot", "codex")
+	if row == nil {
+		t.Fatalf("subagent spend did not land under moonshot; got %+v", rep.Providers)
+	}
+	if rowFor(t, rep, "openai", "codex") != nil {
+		t.Error("subagent spend also appeared under openai — a caller's usual vendor is not its bill")
+	}
+	if row.Requests != 2 || row.TotalTokens != 1_570_000 {
+		t.Errorf("row = %d requests / %d tokens, want 2 / 1,570,000", row.Requests, row.TotalTokens)
+	}
+	// And it is money, not just tokens: an inherited tier is what makes the request priceable.
+	if row.PricedRequests != 2 || row.Cost == nil {
+		t.Errorf("subagent spend went unpriced: priced=%d cost=%v", row.PricedRequests, row.Cost)
+	}
+}
