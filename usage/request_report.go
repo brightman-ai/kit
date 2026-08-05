@@ -28,79 +28,27 @@ type requestReportAcc struct {
 	priceVerifiedAt time.Time
 }
 
-// BuildRequestReport is the compatibility report rebuilt from request-grain
-// economic facts. It preserves the existing /usage/report wire shape while
-// fixing per-request tier/effective-date/cache-TTL and local-calendar semantics.
+// BuildRequestReport is the compatibility report rebuilt from request-grain economic facts.
+// It preserves the existing /usage/report wire shape while fixing per-request
+// tier/effective-date/cache-TTL and local-calendar semantics.
+//
+// One implementation, expressed as what it is: aggregate the facts by local day, then fold
+// the days this window covers. A caller that already holds day aggregates skips the first
+// half — see BuildRequestReportFromDaily — and gets the identical number, because there is
+// no second copy of the arithmetic for it to disagree with.
 func BuildRequestReport(window WindowKind, timezone string, now time.Time, facts []transcript.ModelRequestUsage) UsageReport {
-	loc, err := time.LoadLocation(timezone)
-	if err != nil {
-		loc = time.UTC
-		timezone = "UTC"
-	}
-	days := reportDays(window)
-	localNow := now.In(loc)
-	y, m, d := localNow.Date()
-	endExclusive := time.Date(y, m, d, 0, 0, 0, 0, loc).AddDate(0, 0, 1)
-	start := endExclusive.AddDate(0, 0, -days)
+	return BuildRequestReportFromDaily(window, timezone, now,
+		[]map[string]DailyUsage{AggregateDaily(timezone, facts)})
+}
 
-	daysAcc := make(map[string]*requestReportAcc)
-	runtimes := make(map[string]*requestReportAcc)
-	all := &requestReportAcc{costs: make(map[string]float64)}
-	for _, fact := range facts {
-		if fact.At.Before(start) || !fact.At.Before(endExclusive) {
-			continue
-		}
-		date := fact.At.In(loc).Format("2006-01-02")
-		// The two money axes, resolved independently from the evidence each one actually has.
-		// Vendor from the model id (pricing.VendorForModel documents why not from fact.Provider);
-		// caller from the transcript that recorded the fact. Only when the transcript names no
-		// caller at all does the vendor get to suggest one, and that is flagged as a guess.
-		vendor := pricing.VendorForModel(fact.Model)
-		runtime := fact.Runtime
-		if runtime == "" {
-			runtime = runtimeGuessForVendor(vendor)
-		}
-		day := ensureRequestAcc(daysAcc, date)
-		billing := normalizeRequestBilling(fact.BillingMode)
-		rt := ensureProviderAcc(runtimes, vendor, runtime, billing)
-		physicalInput := fact.InputTokens
-		cacheWrite := fact.CacheWrite5mTokens + fact.CacheWrite1hTokens + fact.CacheWriteUnknownTokens
-		physicalTotal := physicalInput + fact.CachedInputTokens + cacheWrite + fact.OutputTokens
-		for _, target := range []*requestReportAcc{day, rt, all} {
-			target.in += physicalInput
-			target.out += fact.OutputTokens
-			target.read += fact.CachedInputTokens
-			target.write += cacheWrite
-			target.requests++
-		}
-		if rt.byModel == nil {
-			rt.byModel = make(map[string]int64)
-		}
-		if rt.byDay == nil {
-			rt.byDay = make(map[string]int64)
-		}
-		rt.byModel[fact.Model] += physicalTotal
-		rt.byDay[date] += physicalTotal
-		projection := ProjectRequestCost(fact)
-		if projection.Complete && projection.APIEquivalent != nil && projection.Currency != "" {
-			for _, target := range []*requestReportAcc{day, rt, all} {
-				if target.costs == nil {
-					target.costs = make(map[string]float64)
-				}
-				target.costs[projection.Currency] += *projection.APIEquivalent
-				target.priced++
-				if !projection.PriceVerifiedAt.IsZero() &&
-					(target.priceVerifiedAt.IsZero() || projection.PriceVerifiedAt.Before(target.priceVerifiedAt)) {
-					target.priceVerifiedAt = projection.PriceVerifiedAt
-				}
-			}
-		}
-	}
-
+// assembleRequestReport turns folded accumulators into the wire shape. Shared by both entry
+// points so day rows, provider rows and the summary can only ever be three views of one fold.
+func assembleRequestReport(window WindowKind, start, endExclusive time.Time, days int,
+	dayTotals, runtimes map[string]*requestReportAcc, all *requestReportAcc) UsageReport {
 	rows := make([]ReportRow, 0, days)
 	for i := 0; i < days; i++ {
 		date := start.AddDate(0, 0, i).Format("2006-01-02")
-		a := daysAcc[date]
+		a := dayTotals[date]
 		row := ReportRow{Date: date}
 		if a != nil {
 			row.InputTokens, row.OutputTokens = a.in, a.out
