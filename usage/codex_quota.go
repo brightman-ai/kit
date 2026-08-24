@@ -1,8 +1,8 @@
 // Package usage — codex_quota.go: the codex ACCOUNT rate limit, read from the rollout
 // transcripts codex writes to ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl.
 //
-// Two things make this harder than "read the last rate_limits object", and getting either
-// wrong produces numbers that look plausible and are simply false:
+// Three things make this harder than "read the last rate_limits object", and getting any of
+// them wrong produces numbers that look plausible and are simply false:
 //
 //  1. A rollout carries SEVERAL limit families. Alongside the account limit
 //     (limit_id "codex", no limit_name) codex emits per-model sub-limits — e.g.
@@ -10,18 +10,29 @@
 //     OWN 5h/7d windows and their own, much lower, usage. The sub-limit heartbeats more
 //     often, so the LAST rate_limits in a file is usually a sub-limit. Reading it reported
 //     "92% left" while `codex /status` said 26% — the account was nearly out of quota and
-//     the UI said it was fine. We therefore select the UNNAMED (account) family and ignore
-//     named per-model limits.
+//     the UI said it was fine. We therefore select the UNNAMED (account) family here and let
+//     the probe publish sub-limits explicitly, where they arrive already labelled.
 //
 //  2. The newest file's newest ACCOUNT entry for a family is not its last line, and may not
 //     even be in the newest file. We take the greatest EVENT timestamp per account family
-//     across the few most recent rollouts, and use it as each reading's capture time — so
-//     "更新于 …" tells the truth instead of tracking a file's mtime.
+//     across recent rollouts, and use it as each reading's capture time — so "更新于 …"
+//     tells the truth instead of tracking a file's mtime.
+//
+//  3. NOT EVERY ROLLOUT IS THIS ACCOUNT'S. Point codex at a translating proxy and it writes
+//     rollouts exactly as before — same shape, same model names — but the traffic is billed
+//     to another vendor, and the upstream returns no rate limits, so codex records
+//     {"limit_id":"codex","primary":null,"secondary":null,…}: a well-formed object with
+//     nothing in it. Scanning a fixed handful of newest files therefore went blind after a
+//     few days of proxied work: 2026-08-22 the four newest rollouts were all proxied, while
+//     the account's real reading (used 100%) sat in the 21st file. The UI said "7 天无数据"
+//     about data that was on disk. We now read each rollout's session_meta.model_provider
+//     first and scan only the ones this account actually paid for.
 //
 // Read-only, no API call, no auth: the same data `codex /status` shows is already on disk.
 package usage
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"os"
@@ -30,10 +41,15 @@ import (
 	"github.com/brightman-ai/kit/transcript"
 )
 
-// codexScanFiles bounds how many recent rollouts we look at. Rollouts reach tens of MB and
-// rate-limit events land at the end, so scanning the tail (transcript.ScanTail) of the few
-// newest files finds the current reading while reading far less than the whole tree.
-const codexScanFiles = 4
+// codexScanFiles bounds how far back a scan walks. It is a BACKSTOP, not a policy: the scan
+// stops as soon as it has an account reading (see codexRolloutScan), so the bound only costs
+// work in the pathological case of an account that has not run for months. It must stay
+// comfortably larger than a burst of proxied sessions — the whole point of item 3 above.
+const codexScanFiles = 80
+
+// codexOwnProvider is the value session_meta.model_provider carries when codex is talking to
+// OpenAI itself. Older rollouts omit the field entirely, which means the same thing.
+const codexOwnProvider = "openai"
 
 // codexRateWindow mirrors one slot of codex's rate_limits (primary=5h / secondary=7d).
 type codexRateWindow struct {
@@ -56,8 +72,8 @@ type codexRateLimits struct {
 
 // isAccountLimit reports whether this object describes the ACCOUNT's quota (the number
 // `codex /status` prints as "5h limit / Weekly limit") rather than one model's sub-limit.
-// A named family is per-model; an unnamed family with no windows at all (the "premium"
-// credits stub) tells us nothing and is equally useless.
+// A named family is per-model; an unnamed family with no windows at all is what a PROXIED
+// session records, and it tells us nothing.
 func (rl codexRateLimits) isAccountLimit() bool {
 	return rl.LimitName == "" && (rl.Primary != nil || rl.Secondary != nil)
 }
@@ -72,20 +88,59 @@ type codexRolloutLine struct {
 	} `json:"payload"`
 }
 
-// codexRolloutReadings returns the newest ACCOUNT reading for EACH limit family observed in
-// recent rollouts. A newer "codex" observation must not erase an older "premium" family —
-// they are independent counters with different window shapes.
+// codexSessionMeta is the first line of every rollout. Only the provider is read: it decides
+// WHOSE account the session's traffic was billed to.
+type codexSessionMeta struct {
+	Type    string `json:"type"`
+	Payload struct {
+		ModelProvider string `json:"model_provider"`
+	} `json:"payload"`
+}
+
+// codexBilledToProvider returns the runtime-side provider id of the NEWEST codex session on this
+// host — i.e. who the traffic being produced right now is billed to. "" when there are no
+// sessions, or when the rollout predates the field (which by definition means OpenAI itself).
 //
-// This source only moves when CODEX chooses to move it, which is the trap: codex records the
-// rate-limit family of the model it is currently RUNNING, so a session on a per-model plan
-// (GPT-5.3-Codex-Spark) leaves the account limit frozen at whatever it was before the switch.
-// No amount of re-reading helps — that is what the probe is for.
-func codexRolloutReadings() []*Reading {
-	observations := latestCodexRateLimitsByFamily(codexSessionsDir())
-	readings := make([]*Reading, 0, len(observations))
-	for _, observation := range observations {
+// This is one line of one file, so every account may ask it freely; it is the single source for
+// the "is this account the one currently being billed?" question that both codex accounts need.
+func codexBilledToProvider() string {
+	files := transcript.NewestFiles(codexSessionsDir(), transcript.RolloutPrefix, transcript.JSONLSuffix, 1)
+	if len(files) == 0 {
+		return ""
+	}
+	return rolloutProvider(files[0])
+}
+
+// codexRolloutScan walks recent rollouts newest-first and returns the newest ACCOUNT reading per
+// limit family, considering only the sessions THIS account actually paid for.
+func codexRolloutScan() []*Reading {
+	root := codexSessionsDir()
+	byFamily := make(map[string]codexRateLimitObservation)
+
+	for _, path := range transcript.NewestFiles(root, transcript.RolloutPrefix, transcript.JSONLSuffix, codexScanFiles) {
+		if provider := rolloutProvider(path); provider != "" && provider != codexOwnProvider {
+			continue // somebody else's bill — its rate_limits are empty by construction
+		}
+		for family, candidate := range scanCodexRateLimitsByFamily(path) {
+			current, exists := byFamily[family]
+			if !exists || candidate.CapturedAt.After(current.CapturedAt) {
+				byFamily[family] = candidate
+			}
+		}
+		// One account reading is enough: files are newest-first, so anything older can only
+		// lose the freshness comparison. Bailing here is what keeps a months-idle account from
+		// costing a full-tree walk.
+		if len(byFamily) > 0 {
+			break
+		}
+	}
+
+	account := Account{Runtime: "codex", Vendor: VendorOpenAI}
+	readings := make([]*Reading, 0, len(byFamily))
+	for _, observation := range byFamily {
 		rl := observation.RateLimits
 		readings = append(readings, &Reading{
+			Account:    account,
 			CapturedAt: observation.CapturedAt,
 			Source:     SourceRollout,
 			Plan:       rl.PlanType,
@@ -97,9 +152,26 @@ func codexRolloutReadings() []*Reading {
 	return newestReadingsByFamily(readings...)
 }
 
-// codexRolloutReading is the compatibility projection used by older package callers/tests.
-func codexRolloutReading() *Reading {
-	return newestReading(codexRolloutReadings()...)
+// rolloutProvider reads session_meta (always the FIRST line) and returns the runtime-side
+// provider id the session ran against. "" when the field is absent — older rollouts predate it
+// and were, by definition, talking to OpenAI.
+func rolloutProvider(path string) string {
+	f, err := os.Open(path) //nolint:gosec — read-only transcript scan
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+
+	r := bufio.NewReaderSize(f, 64*1024)
+	line, err := r.ReadBytes('\n')
+	if err != nil && len(line) == 0 {
+		return ""
+	}
+	var meta codexSessionMeta
+	if json.Unmarshal(bytes.TrimRight(line, "\r\n"), &meta) != nil {
+		return ""
+	}
+	return meta.Payload.ModelProvider
 }
 
 // codexWindows maps codex's primary/secondary slots onto the unified windows.
@@ -114,51 +186,14 @@ func codexWindows(primary, secondary *codexRateWindow) []QuotaWindow {
 	return out
 }
 
-// latestCodexRateLimits returns the most recent ACCOUNT rate-limit reading across the few
-// newest rollouts, along with when it was captured. ok=false when no such reading exists.
-func latestCodexRateLimits(root string) (rl codexRateLimits, capturedAt time.Time, ok bool) {
-	for _, observation := range latestCodexRateLimitsByFamily(root) {
-		if !ok || observation.CapturedAt.After(capturedAt) {
-			rl, capturedAt, ok = observation.RateLimits, observation.CapturedAt, true
-		}
-	}
-	return rl, capturedAt, ok
-}
-
 type codexRateLimitObservation struct {
 	RateLimits codexRateLimits
 	CapturedAt time.Time
 }
 
-func latestCodexRateLimitsByFamily(root string) []codexRateLimitObservation {
-	byFamily := make(map[string]codexRateLimitObservation)
-	for _, path := range transcript.NewestFiles(root, transcript.RolloutPrefix, transcript.JSONLSuffix, codexScanFiles) {
-		for family, candidate := range scanCodexRateLimitsByFamily(path) {
-			current, exists := byFamily[family]
-			if !exists || candidate.CapturedAt.After(current.CapturedAt) {
-				byFamily[family] = candidate
-			}
-		}
-	}
-	out := make([]codexRateLimitObservation, 0, len(byFamily))
-	for _, observation := range byFamily {
-		out = append(out, observation)
-	}
-	return out
-}
-
-// scanCodexRateLimits reads the tail of one rollout and returns its newest ACCOUNT reading
-// (by event timestamp) plus that timestamp. Per-model sub-limits are skipped — see the file
+// scanCodexRateLimitsByFamily reads the tail of one rollout and returns its newest ACCOUNT
+// reading per family (by event timestamp). Per-model sub-limits are skipped — see the file
 // header for why reading them silently reports the wrong quota.
-func scanCodexRateLimits(path string) (rl codexRateLimits, capturedAt time.Time, ok bool) {
-	for _, observation := range scanCodexRateLimitsByFamily(path) {
-		if !ok || observation.CapturedAt.After(capturedAt) {
-			rl, capturedAt, ok = observation.RateLimits, observation.CapturedAt, true
-		}
-	}
-	return rl, capturedAt, ok
-}
-
 func scanCodexRateLimitsByFamily(path string) map[string]codexRateLimitObservation {
 	byFamily := make(map[string]codexRateLimitObservation)
 	needle := []byte("rate_limits")
@@ -175,7 +210,7 @@ func scanCodexRateLimitsByFamily(path string) map[string]codexRateLimitObservati
 			candidate = row.Payload.RateLimits
 		}
 		if candidate == nil || !candidate.isAccountLimit() {
-			return true // a per-model sub-limit — reading it would report the wrong quota
+			return true // a per-model sub-limit, or a proxied session's empty shell
 		}
 		at, _ := time.Parse(time.RFC3339, row.Timestamp)
 		family := candidate.LimitID
@@ -207,16 +242,12 @@ func codexQuotaWindow(w *codexRateWindow) (QuotaWindow, bool) {
 	if w == nil || w.WindowMinutes <= 0 {
 		return QuotaWindow{}, false
 	}
-	kind := "7d"
-	if w.WindowMinutes <= 300 {
-		kind = "5h"
-	}
 	remaining := 100 - w.UsedPercent
 	if remaining < 0 {
 		remaining = 0
 	}
 	q := QuotaWindow{
-		Kind:             kind,
+		Kind:             windowKind(w.WindowMinutes),
 		WindowMinutes:    w.WindowMinutes,
 		UsedPercent:      w.UsedPercent,
 		RemainingPercent: remaining,

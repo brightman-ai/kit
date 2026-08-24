@@ -460,3 +460,34 @@ func TestScanDeepworkRequestUsageRejectsConflictingImmutableID(t *testing.T) {
 		t.Fatalf("conflicting immutable ID must fail closed, got %v", err)
 	}
 }
+
+// A claude fact must state NO endpoint.
+//
+// This scanner used to stamp Provider:"anthropic" on every claude row — a value invented here,
+// which the codex branch of the same file explicitly refuses to do ("stamping openai made a kimi
+// run look like an OpenAI one"). It was never harmless: Claude Code can be pointed at a Coding
+// Plan relay via ANTHROPIC_BASE_URL and the transcript looks identical, so the field asserted
+// something the file had not observed. A consumer that cross-checks the endpoint against the model
+// id then reads glm-5.3 answered by "anthropic" as a contradiction and files 625 measured GLM rows
+// under the wrong vendor.
+func TestScanClaudeRequestUsage_RecordsNoProviderItDidNotObserve(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "session-glm.jsonl")
+	line := `{"type":"assistant","timestamp":"2026-08-20T02:00:00Z","message":{"id":"msg_glm","model":"glm-5.3","usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"service_tier":"standard"}}}`
+	if err := os.WriteFile(path, []byte(line+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	facts, err := ScanClaudeRequestUsage(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(facts) != 1 {
+		t.Fatalf("facts=%d, want 1", len(facts))
+	}
+	if facts[0].Provider != "" {
+		t.Fatalf("Provider=%q — claude records no endpoint, so the honest value is empty", facts[0].Provider)
+	}
+	if facts[0].Model != "glm-5.3" {
+		t.Fatalf("Model=%q, want the id the vendor echoed back", facts[0].Model)
+	}
+}

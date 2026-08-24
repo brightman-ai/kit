@@ -3,7 +3,6 @@ package usage
 import (
 	"time"
 
-	"github.com/brightman-ai/kit/pricing"
 	"github.com/brightman-ai/kit/transcript"
 )
 
@@ -48,15 +47,19 @@ func AggregateDaily(timezone string, facts []transcript.ModelRequestUsage) map[s
 			out[date] = day
 		}
 		// The two money axes, resolved independently from the evidence each one actually has.
-		// Vendor from the model id (pricing.VendorForModel documents why not from fact.Provider);
-		// caller from the transcript that recorded the fact. Only when the transcript names no
-		// caller at all does the vendor get to suggest one, and that is flagged as a guess.
-		vendor := pricing.VendorForModel(fact.Model)
+		// Vendor from the model id CROSS-CHECKED against the endpoint the runtime dialled (see
+		// attribution.go — the model id alone made a relayed Kimi turn read as OpenAI); caller from
+		// the transcript that recorded the fact. Only when the transcript names no caller at all
+		// does the vendor get to suggest one, and that is flagged as a guess.
+		attributed := attributeUsage(fact.Provider, fact.Model)
+		vendor := attributed.Vendor
 		runtime := fact.Runtime
 		if runtime == "" {
 			runtime = runtimeGuessForVendor(vendor)
 		}
-		acc := ensureProviderAcc(day.providers, vendor, runtime, normalizeRequestBilling(fact.BillingMode))
+		acc := ensureProviderAcc(day.providers, vendor, runtime, normalizeRequestBilling(fact.BillingMode), fact.Provider)
+		acc.endpointKnown = attributed.EndpointKnown
+		acc.conflict = acc.conflict || attributed.Conflict
 
 		physicalInput := fact.InputTokens
 		cacheWrite := fact.CacheWrite5mTokens + fact.CacheWrite1hTokens + fact.CacheWriteUnknownTokens
@@ -118,11 +121,15 @@ func BuildRequestReportFromDaily(window WindowKind, timezone string, now time.Ti
 				if merged == nil {
 					merged = &requestReportAcc{
 						vendor: acc.vendor, runtime: acc.runtime, billing: acc.billing,
+						endpoint: acc.endpoint, endpointKnown: acc.endpointKnown,
 						costs: make(map[string]float64), byModel: make(map[string]int64),
 						byDay: make(map[string]int64),
 					}
 					providers[key] = merged
 				}
+				// One contradicted day contradicts the window. Same shape as priceVerifiedAt taking
+				// the oldest: a window publishes its bound, not its best day.
+				merged.conflict = merged.conflict || acc.conflict
 				// Every target gets the same addition. The day row and the window summary are
 				// not separate measurements of the corpus, they are the same one folded over
 				// different keys — deriving them from anything else is how they drift apart.

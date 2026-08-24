@@ -37,6 +37,15 @@ func ProjectRequestCost(f transcript.ModelRequestUsage) RequestCostProjection {
 		result.Diagnostics = append(result.Diagnostics, "missing_model_or_timestamp")
 		return result
 	}
+	// The endpoint the runtime dialled contradicts the model id it reports, so the id is a facade
+	// and cannot key a rate card — measured here as 144 Kimi turns wearing `gpt-5.6-sol`, priced at
+	// OpenAI's list. The refusal lives HERE, beside the other refusals, so it protects every caller
+	// of this function rather than one report; see attribution.go for why the endpoint vendor's own
+	// rates are not substituted either.
+	if !attributeUsage(f.Provider, f.Model).Priceable {
+		result.Diagnostics = append(result.Diagnostics, "model_id_contradicted_by_endpoint")
+		return result
+	}
 	if f.CacheWriteUnknownTokens > 0 {
 		result.Diagnostics = append(result.Diagnostics, "cache_write_ttl_unknown")
 		return result

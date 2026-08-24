@@ -16,6 +16,16 @@ type requestReportAcc struct {
 	vendor  pricing.Vendor
 	runtime string
 	billing string
+	// endpoint is the runtime-side provider id this bucket's traffic was dialled through
+	// ("mimo2codex-kimi-coding"), "" when the transcript records none. Part of the identity: going
+	// direct and going through a relay are two different spends, and one of them can be unpriceable
+	// while the other is not.
+	endpoint string
+	// endpointKnown / conflict are the two facts the published basis is derived from. Booleans
+	// rather than a merged label: endpointKnown is fixed by the key, and conflict is a plain OR
+	// over the bucket's requests. See derivedBasis in attribution.go.
+	endpointKnown bool
+	conflict      bool
 
 	in, out, read, write int64
 	costs                map[string]float64
@@ -81,10 +91,11 @@ func assembleRequestReport(window WindowKind, start, endExclusive time.Time, day
 		row := ProviderRow{
 			Vendor: a.vendor.ID, VendorDisplay: a.vendor.Display,
 			Runtime: a.runtime, BillingMode: a.billing, BillingCoverage: billingCoverage(a.billing),
+			RuntimeProvider: a.endpoint, AttributionBasis: derivedBasis(a.endpoint, a.endpointKnown, a.conflict),
 			InputTokens: a.in, OutputTokens: a.out,
 			CacheReadTokens: a.read, CacheCreateTokens: a.write,
 			TotalTokens: a.in + a.out + a.read + a.write, TopModel: topKey(a.byModel),
-			UnitPrices: pricing.PublishedRates(topKey(a.byModel)),
+			UnitPrices: publishedRatesFor(a.vendor, topKey(a.byModel)),
 			Requests:   a.requests, PricedRequests: a.priced,
 			Spark: requestDaySpark(start, days, a.byDay), Costs: roundedCosts(a.costs),
 		}
@@ -108,7 +119,10 @@ func assembleRequestReport(window WindowKind, start, endExclusive time.Time, day
 		if l.Runtime != r.Runtime {
 			return l.Runtime < r.Runtime
 		}
-		return l.BillingMode < r.BillingMode
+		if l.BillingMode != r.BillingMode {
+			return l.BillingMode < r.BillingMode
+		}
+		return l.RuntimeProvider < r.RuntimeProvider
 	})
 	return UsageReport{
 		Window: window, StartDate: start.Format("2006-01-02"), EndDate: endExclusive.Add(-time.Nanosecond).Format("2006-01-02"),
@@ -156,19 +170,21 @@ func ensureRequestAcc(values map[string]*requestReportAcc, key string) *requestR
 	return value
 }
 
-// ensureProviderAcc buckets by the FULL identity (vendor, caller, billing).
+// ensureProviderAcc buckets by the FULL identity (vendor, caller, billing, endpoint).
 //
-// All three belong in the key. Dropping vendor is the bug being repaid — it merged a DeepSeek
+// All four belong in the key. Dropping vendor is the bug being repaid — it merged a DeepSeek
 // request into a codex row that then read as OpenAI. Dropping billing would merge the two halves
 // of a mid-window auth switch, and dropping the caller would lose the "who spent it" sub-rows the
-// UI shows under each vendor. Splitting later is impossible; summing later is trivial.
-func ensureProviderAcc(values map[string]*requestReportAcc, vendor pricing.Vendor, runtime, billing string) *requestReportAcc {
-	key := vendor.ID + "\x00" + runtime + "\x00" + billing
+// UI shows under each vendor. Dropping the endpoint would merge codex-direct with codex-via-relay,
+// which differ in whether their model ids can be priced at all. Splitting later is impossible;
+// summing later is trivial.
+func ensureProviderAcc(values map[string]*requestReportAcc, vendor pricing.Vendor, runtime, billing, endpoint string) *requestReportAcc {
+	key := vendor.ID + "\x00" + runtime + "\x00" + billing + "\x00" + endpoint
 	if value := values[key]; value != nil {
 		return value
 	}
 	value := &requestReportAcc{
-		vendor: vendor, runtime: runtime, billing: billing,
+		vendor: vendor, runtime: runtime, billing: billing, endpoint: endpoint,
 		costs: make(map[string]float64),
 	}
 	values[key] = value

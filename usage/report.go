@@ -58,7 +58,11 @@ type ReportSummary struct {
 	CostComplete bool `json:"cost_complete"`
 }
 
-// ProviderRow is one (vendor, caller, billing) slice of a window's usage.
+// ProviderRow is one (vendor, caller, billing, endpoint) slice of a window's usage.
+//
+// NOTE FOR CONSUMERS: there can be SEVERAL rows per vendor, and there always could be — one vendor
+// reached by two callers, or one caller through two endpoints (direct and relayed), which differ in
+// whether their model ids are priceable at all. Group before you display; never index by vendor.
 //
 // It carries the two money questions on SEPARATE axes, because they have different answers:
 //
@@ -86,6 +90,15 @@ type ProviderRow struct {
 	// Runtime is the canonical caller kind ("claude"|"codex"|"gemini"|"other"). Data-driven, not
 	// an enum: a new agent that produces facts shows up here without a code change.
 	Runtime string `json:"runtime"`
+	// RuntimeProvider is the endpoint the caller dialled, in the caller's own vocabulary
+	// ("openai", "mimo2codex-kimi-coding"). Empty when the transcript records none — claude never
+	// does. It is shown, not just used: when a relay's model id turns out to be a facade, the id
+	// the user configured is the only handle they have on which traffic this row is.
+	RuntimeProvider string `json:"runtime_provider,omitempty"`
+	// AttributionBasis says HOW Vendor was decided — model | confirmed | endpoint | unverified
+	// (see attribution.go). A row that merges several requests reports the weakest basis it
+	// contains, so this is a bound rather than a best case. Empty on legacy payloads.
+	AttributionBasis string `json:"attribution_basis,omitempty"`
 	// BillingMode is request-time evidence (subscription|api|unknown). A runtime
 	// may therefore produce multiple rows in one window after an auth switch.
 	BillingMode       string             `json:"billing_mode"`
@@ -164,10 +177,18 @@ type DayTokens struct {
 	CacheCreateTokens int64
 }
 
-// ModelTokens is one (date, model) deduplicated token bundle (CHG-014 R3 cost dim).
+// ModelTokens is one (date, endpoint, model) deduplicated token bundle (CHG-014 R3 cost dim).
 type ModelTokens struct {
-	Date              string
-	Model             string
+	Date  string
+	Model string
+	// Provider is the endpoint the caller dialled, when the source records one. It is the same
+	// cross-check the request-grain path applies (see attribution.go): without it this path would
+	// keep filing relayed traffic under the vendor whose model id the relay borrowed, and the two
+	// report paths would disagree about the same corpus.
+	Provider string
+	// Runtime is the CLI that produced the bundle, when the source knows. Empty falls back to
+	// guessing it from the vendor, which cannot be right for a vendor with no CLI of its own.
+	Runtime           string
 	InputTokens       int64
 	OutputTokens      int64
 	CacheReadTokens   int64
@@ -324,6 +345,9 @@ func buildFromModelBundles(window WindowKind, now time.Time, days int, startDate
 	type provAcc struct {
 		vendor          pricing.Vendor
 		runtime         string
+		endpoint        string
+		endpointKnown   bool
+		conflict        bool
 		in, out, cr, cc int64
 		cost            float64
 		hasCost         bool
@@ -362,12 +386,28 @@ func buildFromModelBundles(window WindowKind, now time.Time, days int, startDate
 		summary.CacheCreateTokens += b.CacheCreateTokens
 		summary.TotalTokens += total
 
-		vendor := pricing.VendorForModel(b.Model)
-		pa := provMap[vendor.ID]
+		attributed := attributeUsage(b.Provider, b.Model)
+		vendor := attributed.Vendor
+		// Same identity grain as the request-grain path: two endpoints reaching one vendor are two
+		// spends, and only one of them may be priceable.
+		key := vendor.ID + "\x00" + b.Provider
+		pa := provMap[key]
 		if pa == nil {
-			pa = &provAcc{vendor: vendor, runtime: runtimeGuessForVendor(vendor), byModel: map[string]int64{}, byDay: map[string]int64{}}
-			provMap[vendor.ID] = pa
+			// The caller is EVIDENCE when the source recorded one; the vendor-shaped guess is only
+			// for sources that cannot say. Without this a relayed codex bundle came out as
+			// runtime "other", because Moonshot has no first-party CLI to guess back to.
+			runtime := b.Runtime
+			if runtime == "" {
+				runtime = runtimeGuessForVendor(vendor)
+			}
+			pa = &provAcc{
+				vendor: vendor, runtime: runtime, endpoint: b.Provider,
+				endpointKnown: attributed.EndpointKnown,
+				byModel:       map[string]int64{}, byDay: map[string]int64{},
+			}
+			provMap[key] = pa
 		}
+		pa.conflict = pa.conflict || attributed.Conflict
 		pa.in += b.InputTokens
 		pa.out += b.OutputTokens
 		pa.cr += b.CacheReadTokens
@@ -375,7 +415,10 @@ func buildFromModelBundles(window WindowKind, now time.Time, days int, startDate
 		pa.byModel[b.Model] += total
 		pa.byDay[b.Date] += total
 
-		cr := ComputeCost(b.Model, b.InputTokens, b.OutputTokens, b.CacheReadTokens, b.CacheCreateTokens)
+		cr := CostResult{}
+		if attributed.Priceable {
+			cr = ComputeCost(b.Model, b.InputTokens, b.OutputTokens, b.CacheReadTokens, b.CacheCreateTokens)
+		}
 		if cr.HasPrice {
 			anyPrice = true
 			da.cost += cr.TotalCost
@@ -437,6 +480,8 @@ func buildFromModelBundles(window WindowKind, now time.Time, days int, startDate
 			Vendor:            pa.vendor.ID,
 			VendorDisplay:     pa.vendor.Display,
 			Runtime:           pa.runtime,
+			RuntimeProvider:   pa.endpoint,
+			AttributionBasis:  derivedBasis(pa.endpoint, pa.endpointKnown, pa.conflict),
 			InputTokens:       pa.in,
 			OutputTokens:      pa.out,
 			CacheReadTokens:   pa.cr,

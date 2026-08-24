@@ -33,12 +33,20 @@ func TestComputeCost_KnownModels(t *testing.T) {
 		t.Fatalf("glm-5.2 should be CNY-priced (¥8 for 1M input), got %+v", g)
 	}
 
-	// An unlisted GLM stays unpriced. This assertion used to run the other way — glm-4.7 was
-	// priced at ¥5 by a generic "glm" family key whose output rate was 5.6× under the current
-	// flagship. Being generic is what let it be wrong about every model at once, so the family
-	// key is gone and this is now the contract: unknown id ⟹ no price, and the report says so.
-	if u := ComputeCost("glm-4.7", 1_000_000, 0, 0, 0); u.HasPrice {
-		t.Fatalf("glm-4.7 has no published price here and must stay unpriced, got %+v", u)
+	// glm-4.7 is priced now, and the history is worth keeping straight. It was FIRST priced at ¥5
+	// by a generic "glm" family key whose output rate was 5.6× under the flagship — that key is
+	// gone and is not coming back. It then sat unpriced, which was honest but rendered「无价表」on
+	// 221 real requests. It is priced now by an id-specific, effective-dated rule read off the
+	// vendor's own page, which is the only form that was ever acceptable.
+	//
+	// 1M input alone ⟹ context 1M > 32k ⟹ the long band: ¥4/M.
+	if g47 := ComputeCost("glm-4.7", 1_000_000, 0, 0, 0); !g47.HasPrice || g47.Currency != "CNY" || g47.TotalCost != 4 {
+		t.Fatalf("glm-4.7 should price at the long-context band (¥4 for 1M input), got %+v", g47)
+	}
+
+	// A GLM id nobody has published still stays unpriced — no family fallback ever came back.
+	if u := ComputeCost("glm-9.9-imaginary", 1_000_000, 0, 0, 0); u.HasPrice {
+		t.Fatalf("an unlisted GLM must stay unpriced, got %+v", u)
 	}
 }
 

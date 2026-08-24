@@ -13,9 +13,13 @@
 package usage
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"time"
+
+	"github.com/brightman-ai/kit/pricing"
+	"github.com/brightman-ai/kit/transcript"
 )
 
 // claudeRateWindow mirrors one window of the hook drop file (five_hour/seven_day).
@@ -115,4 +119,64 @@ func claudeQuotaWindow(kind string, w *claudeRateWindow) (QuotaWindow, bool) {
 		q.ResetAt = time.Unix(w.ResetsAt, 0).UTC().Format(time.RFC3339)
 	}
 	return q, true
+}
+
+// ── attribution: which vendor is Claude Code pointed at right now? ────────────
+//
+// The model NAME is authoritative here, and that is worth stating because the codex side had to
+// learn the opposite. Switching ANTHROPIC_BASE_URL to GLM Coding Plan makes claude record
+// `glm-5.3` in its transcript — no proxy rewrites the id back into a `claude-*` one. So unlike a
+// codex session behind a translating proxy, there is nothing to disbelieve.
+
+// claudeAttributionFiles bounds the scan. The newest file is usually the live session, but a
+// sidechain or a just-closed session can sort above it, so look at a few and take the newest
+// assistant row across them.
+const claudeAttributionFiles = 4
+
+// claudeBilledToModel returns the model of the newest assistant message across claude's recent
+// transcripts. "" when there is nothing to read — which the caller must render as unknown.
+func claudeBilledToModel() string {
+	var newestAt, model string
+	for _, path := range transcript.NewestFiles(claudeProjectsDir(), "", transcript.JSONLSuffix, claudeAttributionFiles) {
+		needle := []byte(`"assistant"`)
+		_ = transcript.ScanTail(path, transcript.DefaultTailBytes, func(line []byte) bool {
+			if !bytes.Contains(line, needle) {
+				return true
+			}
+			var row struct {
+				Type      string `json:"type"`
+				Timestamp string `json:"timestamp"`
+				Message   struct {
+					Model string `json:"model"`
+				} `json:"message"`
+			}
+			if json.Unmarshal(line, &row) != nil || row.Type != "assistant" || row.Message.Model == "" {
+				return true
+			}
+			if row.Timestamp > newestAt {
+				newestAt, model = row.Timestamp, row.Message.Model
+			}
+			return true
+		})
+	}
+	return model
+}
+
+// claudeAttribution answers "is the traffic Claude Code is producing right now billed to THIS
+// account?" for any claude-runtime account (Anthropic's own, or a Coding Plan behind it).
+// nil when nothing has been recorded yet — unknown is never rendered as no.
+func claudeAttribution(account Account) *Attribution {
+	model := claudeBilledToModel()
+	if model == "" {
+		return nil
+	}
+	vendor := pricing.VendorForModel(model)
+	attribution := &Attribution{Active: vendor.ID == account.Vendor, Vendor: vendor.ID}
+	if vendor.ID != "" {
+		attribution.Display = Account{Runtime: account.Runtime, Vendor: vendor.ID}.Display()
+	} else {
+		// Nobody's model table claims this id. Name the id — it is what the user will recognise.
+		attribution.ProviderID = model
+	}
+	return attribution
 }

@@ -54,6 +54,17 @@ type ModelPrice struct {
 	Currency         string // "USD" or "CNY"
 	ContextThreshold int    // tokens; context > this → Above tier applies (0 = no long-context tier)
 	Above            *Tier  // long-context prices (nil = none)
+	// OutputThreshold / AboveOutput price by ANSWER length, within the short-context band.
+	//
+	// Not a hypothetical shape: Zhipu bills GLM-4.7 and GLM-4.5-Air on both axes at once —
+	// short context with a short answer is one price, short context with a long answer another,
+	// and long context a third regardless of the answer. Two bands cannot express that, and
+	// collapsing it to one costs 2× on GLM-4.7 (¥2 vs ¥4 input, ¥8 vs ¥16 output).
+	//
+	// The context band WINS when both would apply, because that is how the vendor's own table
+	// is written: its long-context row states no output condition at all.
+	OutputThreshold int
+	AboveOutput     *Tier
 }
 
 // Usage is the token counts of a SINGLE request, with cache-write split by TTL.

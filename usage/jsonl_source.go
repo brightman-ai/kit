@@ -192,8 +192,12 @@ func (s *JSONLTokenSource) ScanModelRange(startDate, endDate string) ([]ModelTok
 	out := make([]ModelTokens, 0, len(agg))
 	for k, e := range agg {
 		out = append(out, ModelTokens{
-			Date:              k.date,
-			Model:             k.model,
+			Date:  k.date,
+			Model: k.model,
+			// The caller is known here by construction — this source walks claude's own transcript
+			// tree — so it is stated rather than guessed back from the vendor. Provider stays empty:
+			// Claude Code records no endpoint, and inventing one is the bug this axis exists to fix.
+			Runtime:           "claude",
 			InputTokens:       e.input,
 			OutputTokens:      e.output,
 			CacheReadTokens:   e.cacheRead,

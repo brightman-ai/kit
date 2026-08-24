@@ -8,7 +8,12 @@ import (
 // CatalogVersion identifies the immutable pricing snapshot used by a quote.
 // Updating a price creates new effective-dated rules and a new version; it does
 // not rewrite historical request facts.
-const CatalogVersion = "2026-08-03.1"
+//
+// 2026-08-22.1: 智谱 GLM rate cards (glm-4.7 / 4.7-flash / 4.7-flashx / 5.2 / 5.3). The bump is
+// load-bearing, not bookkeeping: economic projections are cached per file and per ended day, and
+// pricingSnapshot keys that cache on this constant. Adding rules without bumping would leave 221
+// already-projected GLM requests reading「无价表」forever, while the catalog claimed to price them.
+const CatalogVersion = "2026-08-22.1"
 const FastModeSourceURL = "https://developers.openai.com/codex/agent-configuration/speed"
 
 // catalogSnapshotDate is when the bulk of this catalog was last transcribed from upstream. A rule
@@ -57,8 +62,13 @@ type RequestQuote struct {
 func (q RequestQuote) Cost(u Usage) (float64, string) {
 	tier := q.Price.Tier
 	context := u.Input + u.CacheRead + u.CacheWrite5m + u.CacheWrite1h
-	if q.Price.ContextThreshold > 0 && q.Price.Above != nil && context > q.Price.ContextThreshold {
+	switch {
+	case q.Price.ContextThreshold > 0 && q.Price.Above != nil && context > q.Price.ContextThreshold:
 		tier = *q.Price.Above
+	case q.Price.OutputThreshold > 0 && q.Price.AboveOutput != nil && u.Output > q.Price.OutputThreshold:
+		// Only reachable inside the short-context band — the vendor's long-context row carries no
+		// output condition, so context must be decided first. See ModelPrice.OutputThreshold.
+		tier = *q.Price.AboveOutput
 	}
 	return tierCost(tier, u), q.Price.Currency
 }
@@ -106,6 +116,13 @@ type publishedPrice struct {
 	sourceURL string
 }
 
+// Band names the condition a rate card applies under, for vendors that price by length.
+const (
+	BandBase        = "base"         // short context and short answer — the cheapest band
+	BandLongOutput  = "long_output"  // answer at or above Threshold tokens
+	BandLongContext = "long_context" // context at or above Threshold tokens
+)
+
 // RateCard is a published price for a model, as a surface should show it: an explicit currency,
 // the per-million rates, and the page that says so.
 type RateCard struct {
@@ -114,16 +131,58 @@ type RateCard struct {
 	OutputPerM    float64 `json:"output_per_m"`
 	CacheReadPerM float64 `json:"cache_read_per_m"`
 	SourceURL     string  `json:"source_url,omitempty"`
-	// Primary marks the card the money on screen was actually computed with. The others are
-	// context, shown so the number cannot be misread as the wrong currency.
-	Primary bool `json:"primary,omitempty"`
+	// Primary marks the LIST the money on screen was computed from. Others are context, shown so
+	// the number cannot be misread as the wrong currency. A banded model contributes several
+	// primary cards — one per band — because any of them may have priced part of the total.
+	//
+	// NO omitempty. FALSE is the informative value here: it is what says「this is another
+	// platform's list, not another band of this one」. Dropped from the wire, a consumer reads
+	// undefined and cannot tell the two apart — observed exactly that way, rendering Kimi's two
+	// PLATFORM prices as「¥20/¥100 · $3/$15」, i.e. as if they were tiers of one list. Same trap as
+	// Credits.WholeDays; the rule is that a boolean whose false carries the meaning always ships.
+	Primary bool `json:"primary"`
+	// Band is "" for a model with a single price, else one of BandBase / BandLongOutput /
+	// BandLongContext. Threshold is the token count this band applies AT OR ABOVE, written the way
+	// the vendor writes it (「[32,200)」→ 32000), not the engine's strict-greater boundary.
+	//
+	// These exist because a card that names only the cheapest band is worse than no card. The
+	// field's whole purpose is to let a reader re-derive the total; publishing ¥2/M for a model
+	// charged at ¥4/M hands them an arithmetic that cannot close, and they have no way to see why.
+	// Measured before this was added: gpt-5.6-sol advertised $5/$30 while long-context requests —
+	// the ones that dominate a coding session — were charged $10/$60.
+	Band      string `json:"band,omitempty"`
+	Threshold int    `json:"threshold,omitempty"`
 }
 
-func rateCard(price ModelPrice, sourceURL string, primary bool) RateCard {
-	return RateCard{
-		Currency: price.Currency, InputPerM: price.InputPerM, OutputPerM: price.OutputPerM,
-		CacheReadPerM: price.CacheReadPerM, SourceURL: sourceURL, Primary: primary,
+// rateCards expands one published price into every band it charges under, cheapest first.
+//
+// A flat price yields exactly one card with no band, so nothing changes for the models that have
+// one price. A banded price yields one card per band, each carrying the boundary it starts at —
+// which is what lets a surface write「≤32k ¥2/¥8 · >32k ¥4/¥16」instead of a single ¥2/¥8 that the
+// total will never agree with.
+//
+// Thresholds are converted back to the VENDOR's notation on the way out. The engine stores
+// 31_999 because it compares strictly greater; the vendor's page says 32k, and the reader is
+// checking against the page, not against this code.
+func rateCards(price ModelPrice, sourceURL string, primary bool) []RateCard {
+	card := func(t Tier, band string, threshold int) RateCard {
+		return RateCard{
+			Currency: price.Currency, InputPerM: t.InputPerM, OutputPerM: t.OutputPerM,
+			CacheReadPerM: t.CacheReadPerM, SourceURL: sourceURL, Primary: primary,
+			Band: band, Threshold: threshold,
+		}
 	}
+	if price.Above == nil && price.AboveOutput == nil {
+		return []RateCard{card(price.Tier, "", 0)}
+	}
+	cards := []RateCard{card(price.Tier, BandBase, 0)}
+	if price.AboveOutput != nil {
+		cards = append(cards, card(*price.AboveOutput, BandLongOutput, price.OutputThreshold+1))
+	}
+	if price.Above != nil {
+		cards = append(cards, card(*price.Above, BandLongContext, price.ContextThreshold+1))
+	}
+	return cards
 }
 
 // PublishedRates returns every rate card known for a model, the one used for money first.
@@ -143,14 +202,14 @@ func PublishedRates(model string) []RateCard {
 		if !matchesAnyModel(normalize(model), rule.models) {
 			continue
 		}
-		cards := []RateCard{rateCard(rule.price, rule.sourceURL, true)}
+		cards := rateCards(rule.price, rule.sourceURL, true)
 		for _, alt := range rule.alsoPublishedAs {
-			cards = append(cards, rateCard(alt.price, alt.sourceURL, false))
+			cards = append(cards, rateCards(alt.price, alt.sourceURL, false)...)
 		}
 		return cards
 	}
 	if quote, ok := QuoteFromSnapshot(model, "standard"); ok {
-		return []RateCard{rateCard(quote.Price, quote.SourceURL, true)}
+		return rateCards(quote.Price, quote.SourceURL, true)
 	}
 	return nil
 }
@@ -269,6 +328,8 @@ func buildCatalogRules() []catalogRule {
 	kimiPricing := "https://platform.kimi.ai/docs/pricing/chat-k3"
 	kimiPricingCN := "https://platform.moonshot.cn/docs/pricing/chat-k3"
 	deepseekPricing := "https://api-docs.deepseek.com/quick_start/pricing"
+	zhipuPricing := "https://open.bigmodel.cn/pricing"
+	zhipuVerified := mustDate("2026-08-22")
 	thirdPartyVerified := mustDate("2026-08-03")
 	kimiVerified := mustDate("2026-08-04")
 	credits := func(in, cached, out float64) *Tier {
@@ -393,6 +454,106 @@ func buildCatalogRules() []catalogRule {
 		{id: "deepseek.v4-pro.standard.v1", models: []string{"deepseek-v4-pro"}, serviceTier: "standard", from: from2026,
 			price:     ModelPrice{Tier: Tier{InputPerM: 0.435, CacheReadPerM: 0.003625, OutputPerM: 0.87}, Currency: "USD"},
 			sourceURL: deepseekPricing, verifiedAt: thirdPartyVerified},
+
+		// ── 智谱 GLM ────────────────────────────────────────────────────────────────────────
+		//
+		// Reached through Claude Code with ANTHROPIC_BASE_URL pointed at open.bigmodel.cn (a GLM
+		// Coding Plan), which is why the ids arrive in claude transcripts. Measured here: 224
+		// requests across glm-4.7 and glm-5.3, all of them unpriced — `price_rule_missing` — so the
+		// row rendered「—」while its tokens were exact.
+		//
+		// Read off Zhipu's own price page on 2026-08-22 (rendered, since it is a SPA that serves
+		// no prices to a plain fetch). Prices are CNY per 1M tokens, and the columns are
+		// 输入单价 / 输出单价 / 缓存存储(每小时) / 缓存命中.
+		//
+		// 缓存存储 is「限时免费」today, so cache-WRITE is zero. That is a promotion, not a permanent
+		// price: when it ends this needs a new effective-dated rule rather than an edit, exactly as
+		// DeepSeek's announced peak-hours multiplier above is deliberately not pre-modelled.
+		//
+		// ORDER MATTERS, TWICE. matchesAnyModel is exact-or-prefix-plus-dash, so
+		//
+		//	"glm-4.7" also matches "glm-4.7-flashx"  — ¥0.5 vs ¥2–4, up to 8× too much
+		//	"glm-5"   also matches "glm-5-turbo"     — ¥4–6 vs ¥5–7
+		//
+		// Quote returns the FIRST matching rule, so every specific id is listed before the family
+		// it would otherwise be swallowed by. TestGLM_SpecificIdsBeatTheirPrefixes pins both;
+		// without it, reordering this block silently changes what people are billed.
+		{id: "zhipu.glm-4.7-flash.standard.v1", models: []string{"glm-4.7-flash"}, serviceTier: "standard", from: from2026,
+			price:     ModelPrice{Tier: Tier{InputPerM: 0, CacheReadPerM: 0, OutputPerM: 0}, Currency: "CNY"},
+			sourceURL: zhipuPricing, verifiedAt: zhipuVerified},
+		{id: "zhipu.glm-4.7-flashx.standard.v1", models: []string{"glm-4.7-flashx"}, serviceTier: "standard", from: from2026,
+			price:     ModelPrice{Tier: Tier{InputPerM: 0.5, CacheReadPerM: 0.1, OutputPerM: 3}, Currency: "CNY"},
+			sourceURL: zhipuPricing, verifiedAt: zhipuVerified},
+
+		// GLM-4.7 and GLM-4.5-Air are banded on BOTH axes:
+		//
+		//	输入长度 [0,32) 输出长度 [0,0.2)  →  4.7: ¥2 / ¥8  / ¥0.4    4.5-Air: ¥0.8 / ¥2 / ¥0.16
+		//	输入长度 [0,32) 输出长度 [0.2+)   →  4.7: ¥3 / ¥14 / ¥0.6    4.5-Air: ¥0.8 / ¥6 / ¥0.16
+		//	输入长度 [32,…)                  →  4.7: ¥4 / ¥16 / ¥0.8    4.5-Air: ¥1.2 / ¥8 / ¥0.24
+		//
+		// Lengths are 千tokens on the page. The vendor's bands are half-open from BELOW
+		// (「[32,200)」starts AT 32k) while this engine compares strictly greater — hence 31_999
+		// and 199, the same boundaries written for a `>` test on integer token counts.
+		//
+		// Measured on this account: average context 62,788 tokens, average answer 368 — real
+		// traffic sits in the long-context band, so collapsing this to one price would have been a
+		// 2× error, not a rounding one.
+		{id: "zhipu.glm-4.7.standard.v1", models: []string{"glm-4.7"}, serviceTier: "standard", from: from2026,
+			price: ModelPrice{
+				Tier:             Tier{InputPerM: 2, CacheReadPerM: 0.4, OutputPerM: 8},
+				Currency:         "CNY",
+				OutputThreshold:  199,
+				AboveOutput:      &Tier{InputPerM: 3, CacheReadPerM: 0.6, OutputPerM: 14},
+				ContextThreshold: 31_999,
+				Above:            &Tier{InputPerM: 4, CacheReadPerM: 0.8, OutputPerM: 16},
+			},
+			sourceURL: zhipuPricing, verifiedAt: zhipuVerified},
+		{id: "zhipu.glm-4.5-air.standard.v1", models: []string{"glm-4.5-air"}, serviceTier: "standard", from: from2026,
+			price: ModelPrice{
+				Tier:             Tier{InputPerM: 0.8, CacheReadPerM: 0.16, OutputPerM: 2},
+				Currency:         "CNY",
+				OutputThreshold:  199,
+				AboveOutput:      &Tier{InputPerM: 0.8, CacheReadPerM: 0.16, OutputPerM: 6},
+				ContextThreshold: 31_999,
+				Above:            &Tier{InputPerM: 1.2, CacheReadPerM: 0.24, OutputPerM: 8},
+			},
+			sourceURL: zhipuPricing, verifiedAt: zhipuVerified},
+
+		// GLM-5.3 / 5.2 are flat across their whole 1M context — no bands at all.
+		{id: "zhipu.glm-5.3.standard.v1", models: []string{"glm-5.3"}, serviceTier: "standard", from: from2026,
+			price:     ModelPrice{Tier: Tier{InputPerM: 8, CacheReadPerM: 2, OutputPerM: 28}, Currency: "CNY"},
+			sourceURL: zhipuPricing, verifiedAt: zhipuVerified},
+		{id: "zhipu.glm-5.2.standard.v1", models: []string{"glm-5.2"}, serviceTier: "standard", from: from2026,
+			price:     ModelPrice{Tier: Tier{InputPerM: 8, CacheReadPerM: 2, OutputPerM: 28}, Currency: "CNY"},
+			sourceURL: zhipuPricing, verifiedAt: zhipuVerified},
+
+		// GLM-5.1 / 5-Turbo / 5 are banded on input length only. glm-5.1 previously lived in the
+		// embedded table as a FLAT ¥6/¥24 — its short band alone — which under-charged every
+		// request over 32k by a third. glm-5-turbo must precede glm-5: see the ordering note above.
+		{id: "zhipu.glm-5.1.standard.v1", models: []string{"glm-5.1"}, serviceTier: "standard", from: from2026,
+			price: ModelPrice{
+				Tier:             Tier{InputPerM: 6, CacheReadPerM: 1.3, OutputPerM: 24},
+				Currency:         "CNY",
+				ContextThreshold: 31_999,
+				Above:            &Tier{InputPerM: 8, CacheReadPerM: 2, OutputPerM: 28},
+			},
+			sourceURL: zhipuPricing, verifiedAt: zhipuVerified},
+		{id: "zhipu.glm-5-turbo.standard.v1", models: []string{"glm-5-turbo"}, serviceTier: "standard", from: from2026,
+			price: ModelPrice{
+				Tier:             Tier{InputPerM: 5, CacheReadPerM: 1.2, OutputPerM: 22},
+				Currency:         "CNY",
+				ContextThreshold: 31_999,
+				Above:            &Tier{InputPerM: 7, CacheReadPerM: 1.8, OutputPerM: 26},
+			},
+			sourceURL: zhipuPricing, verifiedAt: zhipuVerified},
+		{id: "zhipu.glm-5.standard.v1", models: []string{"glm-5"}, serviceTier: "standard", from: from2026,
+			price: ModelPrice{
+				Tier:             Tier{InputPerM: 4, CacheReadPerM: 1, OutputPerM: 18},
+				Currency:         "CNY",
+				ContextThreshold: 31_999,
+				Above:            &Tier{InputPerM: 6, CacheReadPerM: 1.5, OutputPerM: 22},
+			},
+			sourceURL: zhipuPricing, verifiedAt: zhipuVerified},
 	}
 }
 

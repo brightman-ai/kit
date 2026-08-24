@@ -60,7 +60,9 @@ func (s *CodexModelScanSource) ScanModelRange(startDate, endDate string) ([]Mode
 		return nil, err
 	}
 
-	type dateModel struct{ date, model string }
+	// Keyed by the endpoint too: one rollout can switch providers mid-session, and merging the
+	// halves would lose the very cross-check the vendor is decided by.
+	type dateModel struct{ date, provider, model string }
 	agg := make(map[dateModel]*ModelTokens, len(metas))
 
 	for _, m := range metas {
@@ -83,10 +85,10 @@ func (s *CodexModelScanSource) ScanModelRange(startDate, endDate string) ([]Mode
 			if model == "" {
 				model = "unknown"
 			}
-			key := dateModel{date: date, model: model}
+			key := dateModel{date: date, provider: e.Provider, model: model}
 			b := agg[key]
 			if b == nil {
-				b = &ModelTokens{Date: date, Model: model}
+				b = &ModelTokens{Date: date, Model: model, Provider: e.Provider, Runtime: "codex"}
 				agg[key] = b
 			}
 			b.InputTokens += int64(e.InputTokens)

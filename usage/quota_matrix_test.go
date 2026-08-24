@@ -2,11 +2,10 @@ package usage
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	"net/http"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -99,6 +98,38 @@ func (e *quotaEnv) withCodexAuth(t *testing.T, apiKey bool) *quotaEnv {
 	}
 	write(t, filepath.Join(e.codexHome, "auth.json"), body)
 	return e
+}
+
+// withCodexSnapshot plants a probe result for the codex/openai account in the persisted shape
+// (one file per account, every family the vendor reported in that single answer).
+func (e *quotaEnv) withCodexSnapshot(t *testing.T, capturedAt time.Time, families ...snapshotFamily) *quotaEnv {
+	t.Helper()
+	snap := quotaSnapshot{
+		Account:    Account{Runtime: "codex", Vendor: VendorOpenAI},
+		CapturedAt: capturedAt.Unix(),
+		Source:     SourceProbe,
+		Plan:       "pro",
+		Billing:    BillingSubscription,
+		Families:   families,
+	}
+	body, err := json.Marshal(snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(e.deepwork, "quota", "codex-openai.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write(t, path, string(body))
+	return e
+}
+
+// sevenDay builds one persisted family carrying a single 7-day window.
+func sevenDay(family string, usedPct float64, resetAt time.Time) snapshotFamily {
+	return snapshotFamily{Family: family, Windows: []QuotaWindow{{
+		Kind: "7d", WindowMinutes: 10080, UsedPercent: usedPct, RemainingPercent: 100 - usedPct,
+		ResetAt: resetAt.UTC().Format(time.RFC3339),
+	}}}
 }
 
 // withCodexRollout plants a rollout shaped like a real one: the ACCOUNT limit (unnamed) is
@@ -416,11 +447,15 @@ func TestQuota_ProbeBeatsOlderRollout_AndSurvivesReload(t *testing.T) {
 	env := newQuotaEnv(t).withCodexAuth(t, false).withCLI(t, "codex")
 	env.withCodexRollout(t, "pro", time.Now().Add(2*time.Hour)) // rollout reading: 2026-07-12T10:00Z
 
-	// A probe taken NOW — hours after the rollout's newest account entry.
-	probe := fmt.Sprintf(
-		`{"captured_at":%d,"source":"probe","plan_type":"pro","primary":{"used_percent":9,"window_minutes":300,"resets_at":%d},"secondary":{"used_percent":16,"window_minutes":10080,"resets_at":%d}}`,
-		time.Now().Unix(), time.Now().Add(3*time.Hour).Unix(), time.Now().Add(150*time.Hour).Unix())
-	write(t, filepath.Join(env.deepwork, "codex-rate-limits.json"), probe)
+	// A probe taken NOW — hours after the rollout's newest account entry. It names the SAME
+	// family the transcript uses ("codex"), which is what lets the two compete at all: when the
+	// probe read a different name for the same window, the halves could never refresh each other.
+	env.withCodexSnapshot(t, time.Now(), snapshotFamily{Family: "codex", Windows: []QuotaWindow{
+		{Kind: "5h", WindowMinutes: 300, UsedPercent: 9, RemainingPercent: 91,
+			ResetAt: time.Now().Add(3 * time.Hour).UTC().Format(time.RFC3339)},
+		{Kind: "7d", WindowMinutes: 10080, UsedPercent: 16, RemainingPercent: 84,
+			ResetAt: time.Now().Add(150 * time.Hour).UTC().Format(time.RFC3339)},
+	}})
 
 	q := (codexProvider{}).Query()
 
@@ -462,10 +497,8 @@ func TestQuota_DifferentFamiliesCoexist_CompatibilityUsesGlobalNewest(t *testing
 	env := newQuotaEnv(t).withCodexAuth(t, false).withCLI(t, "codex")
 	env.withCodexRollout(t, "pro", time.Now().Add(2*time.Hour))
 
-	probe := fmt.Sprintf(
-		`{"captured_at":%d,"source":"probe","plan_type":"pro","family":"premium","primary":{"used_percent":4,"window_minutes":10080,"resets_at":%d}}`,
-		time.Now().Add(-13*time.Hour).Unix(), time.Now().Add(150*time.Hour).Unix())
-	write(t, filepath.Join(env.deepwork, "codex-rate-limits.json"), probe)
+	env.withCodexSnapshot(t, time.Now().Add(-13*time.Hour),
+		sevenDay("premium", 4, time.Now().Add(150*time.Hour)))
 
 	q := (codexProvider{}).Query()
 	if q.Family != "codex" || q.Snapshot == nil || q.Snapshot.Source != SourceRollout {
@@ -492,10 +525,10 @@ func TestQuota_DifferentFamiliesCoexist_CompatibilityUsesGlobalNewest(t *testing
 func TestQuota_SameFamilyKeepsOnlyItsNewestReading(t *testing.T) {
 	env := newQuotaEnv(t).withCodexAuth(t, false).withCLI(t, "codex")
 	env.withCodexRollout(t, "pro", time.Now().Add(2*time.Hour))
-	probe := fmt.Sprintf(
-		`{"captured_at":%d,"source":"probe","plan_type":"pro","family":"codex","primary":{"used_percent":9,"window_minutes":300,"resets_at":%d}}`,
-		time.Now().Unix(), time.Now().Add(3*time.Hour).Unix())
-	write(t, filepath.Join(env.deepwork, "codex-rate-limits.json"), probe)
+	env.withCodexSnapshot(t, time.Now(), snapshotFamily{Family: "codex", Windows: []QuotaWindow{{
+		Kind: "5h", WindowMinutes: 300, UsedPercent: 9, RemainingPercent: 91,
+		ResetAt: time.Now().Add(3 * time.Hour).UTC().Format(time.RFC3339),
+	}}})
 
 	q := (codexProvider{}).Query()
 	if len(q.QuotaGroups) != 1 {
@@ -524,7 +557,7 @@ func TestCodexRollout_KeepsNewestObservationPerAccountFamily(t *testing.T) {
 		line(now.Add(-10*time.Minute), "codex", 18),
 	}, "\n"))
 
-	readings := codexRolloutReadings()
+	readings := codexRolloutScan()
 	if len(readings) != 2 {
 		t.Fatalf("want two account families, got %+v", readings)
 	}
@@ -537,22 +570,22 @@ func TestCodexRollout_KeepsNewestObservationPerAccountFamily(t *testing.T) {
 }
 
 // Probing is a domain fact, not a caller's guess: claude cannot be asked (its usage arrives
-// only when claude itself renders), codex can. ProbeAll says so per runtime.
-func TestProbeAll_ReportsWhatEachRuntimeCanDo(t *testing.T) {
-	newQuotaEnv(t) // no codex auth → codex has no token to ask with either
+// only when claude itself renders), codex can. ProbeAll says so per ACCOUNT — keyed by
+// runtime:vendor, because two accounts now share the codex runtime and a runtime-keyed map
+// would silently drop one of them.
+func TestProbeAll_ReportsWhatEachAccountCanDo(t *testing.T) {
+	newQuotaEnv(t)      // no codex auth → codex has no token to ask with either
+	UseCredentials(nil) // …and no kimi key on this host
+	t.Cleanup(func() { UseCredentials(nil) })
 
-	byRuntime := map[string]string{}
+	byAccount := map[string]string{}
 	for _, r := range ProbeAll(context.Background()) {
-		byRuntime[r.Runtime] = r.Status
+		byAccount[r.Runtime+":"+r.Vendor] = r.Status
 	}
-	if byRuntime["claude"] != ProbeNotSupported {
-		t.Fatalf("claude exposes no endpoint to ask — want not_supported, got %q", byRuntime["claude"])
-	}
-	if byRuntime["gemini"] != ProbeNotSupported {
-		t.Fatalf("gemini is unsupported — want not_supported, got %q", byRuntime["gemini"])
-	}
-	if byRuntime["codex"] != ProbeNotSupported {
-		t.Fatalf("no OAuth token ⟹ nothing to ask with — want not_supported, got %q", byRuntime["codex"])
+	for _, account := range []string{"claude:anthropic", "gemini:google", "codex:openai", "codex:moonshot"} {
+		if byAccount[account] != ProbeNotSupported {
+			t.Fatalf("%s has nothing to ask with — want not_supported, got %q", account, byAccount[account])
+		}
 	}
 }
 
@@ -594,31 +627,24 @@ func TestQuota_DuplicateWindowKindIsDropped(t *testing.T) {
 	}
 }
 
-// The reading says which limit family it speaks for. Without it, a family switch (5h+7d →
-// one 7-day window) looks exactly like the app losing a bar.
-func TestCodexProbe_RecordsActiveFamilyAndDropsEmptySlot(t *testing.T) {
-	h := http.Header{}
-	h.Set("x-codex-active-limit", "premium")
-	h.Set("x-codex-plan-type", "pro")
-	h.Set("x-codex-primary-used-percent", "4")
-	h.Set("x-codex-primary-window-minutes", "10080")
-	h.Set("x-codex-primary-reset-at", strconv.FormatInt(time.Now().Add(160*time.Hour).Unix(), 10))
-	h.Set("x-codex-secondary-used-percent", "0") // the empty slot the account really sends
-	h.Set("x-codex-secondary-window-minutes", "0")
-	h.Set("x-codex-secondary-reset-at", "")
-
-	snap, ok := codexSnapshotFromHeaders(h)
-	if !ok {
-		t.Fatal("a real primary window is a usable reading")
+// The account really does send an unused secondary slot as used=0 / window=0 / reset="".
+// Taking it at face value invented a phantom window that collided with the real one and made a
+// bar disappear. A slot without a length is not a window — in the JSON contract either.
+func TestCodexAPI_DropsTheEmptySecondarySlot(t *testing.T) {
+	windows := codexJSONWindows(codexRateLimitJSON{
+		PrimaryWindow: &codexWindowJSON{
+			UsedPercent: 4, LimitWindowSeconds: 604800, ResetAt: time.Now().Add(160 * time.Hour).Unix(),
+		},
+		SecondaryWindow: &codexWindowJSON{UsedPercent: 0, LimitWindowSeconds: 0},
+	})
+	if len(windows) != 1 {
+		t.Fatalf("want exactly the real 7-day window, got %+v", windows)
 	}
-	if snap.Family != "premium" {
-		t.Fatalf("family = %q, want premium (x-codex-active-limit)", snap.Family)
+	if windows[0].Kind != "7d" || windows[0].WindowMinutes != 10080 {
+		t.Fatalf("seconds must normalise to the 7d window, got %+v", windows[0])
 	}
-	if snap.Secondary != nil {
-		t.Fatal("the empty secondary slot must not become a phantom window")
-	}
-	if snap.Primary == nil || snap.Primary.WindowMinutes != 10080 {
-		t.Fatalf("primary = %+v, want the 7-day window the account actually reports", snap.Primary)
+	if windows[0].UsedPercent != 4 || windows[0].RemainingPercent != 96 {
+		t.Fatalf("used/remaining = %v/%v, want 4/96", windows[0].UsedPercent, windows[0].RemainingPercent)
 	}
 }
 

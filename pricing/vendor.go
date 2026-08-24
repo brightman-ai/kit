@@ -14,17 +14,26 @@ import "strings"
 // ever talk to Anthropic. That stopped being true the moment a CLI could point at any
 // OpenAI-compatible endpoint, and the axis has been quietly lying ever since.
 //
-// The vendor is derived from the MODEL ID and nothing else. The alternatives were considered and
-// rejected on evidence:
+// Here the vendor is derived from the MODEL ID and nothing else. The alternatives were considered
+// and rejected on evidence:
 //
-//   - fact.Provider — for claude it is hardcoded "anthropic" (request_usage.go), and for codex it
-//     is `model_provider_id`, a name the USER invents in ~/.codex/config.toml. On this machine
-//     those are "local_codex", "deepseek" and "mimo2codex-kimi-coding": one canonical, one
-//     meaningless, one a relay's brand. It is routing configuration, not identity.
+//   - fact.Provider — for codex it is `model_provider_id`, a name the USER invents in
+//     ~/.codex/config.toml. On this machine those are "local_codex", "deepseek" and
+//     "mimo2codex-kimi-coding": one canonical, one meaningless, one a relay's brand. It is routing
+//     configuration, not identity. (claude used to hardcode "anthropic" here; that was simply a
+//     value invented at the scanner and has since been removed — Claude Code records no endpoint.)
 //   - the endpoint URL — not recorded in the transcript at all.
 //
 // A model id, by contrast, is what the provider itself echoes back on every request. It is the
-// strongest evidence present, so it is the only evidence used.
+// strongest evidence present, so it is the only evidence used HERE.
+//
+// That last word matters. This function answers "whose model id is this?", which is all pricing
+// needs and all it can defend. It does NOT answer "whose bill did this land on" — a relay can pass
+// the upstream's id straight through, and 144 measured turns of Kimi traffic carried `gpt-5.6-sol`.
+// Catching that needs a second witness (the endpoint) used as a falsifier, which is a different
+// question with a different failure mode, so it lives in usage/attribution.go and calls this from
+// there. Do not fold the two: the day this function starts consulting an endpoint, every price it
+// returns inherits a user-invented string's reliability.
 //
 // Vendor lives HERE, next to the prices, because a vendor and a currency are the same fact seen
 // twice: DeepSeek bills in USD, Kimi bills in USD, and a row that mixes vendors mixes currencies
@@ -86,6 +95,14 @@ var vendorsByID = map[string]Vendor{
 	VendorXAI.ID:       VendorXAI,
 	VendorMistral.ID:   VendorMistral,
 	VendorMiniMax.ID:   VendorMiniMax,
+}
+
+// VendorByID resolves a canonical vendor id. ok=false for an id this codebase has never named —
+// which callers must render as UNKNOWN rather than as a plausible-looking vendor: the whole point
+// of the id table is that being un-named is a real, reportable answer.
+func VendorByID(id string) (Vendor, bool) {
+	v, ok := vendorsByID[id]
+	return v, ok
 }
 
 type vendorEntry struct {

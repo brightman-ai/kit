@@ -270,9 +270,19 @@ func int64Value(value *int) int64 {
 // A request fact is immutable. Pricing and reporting derive projections from it;
 // neither may rewrite the transcript truth.
 type ModelRequestUsage struct {
-	ID              string `json:"id"`
-	Runtime         string `json:"runtime"`
-	Provider        string `json:"provider,omitempty"`
+	ID      string `json:"id"`
+	Runtime string `json:"runtime"`
+	// Provider is the ENDPOINT this request was sent to, named in the producing runtime's own
+	// vocabulary: codex's `model_provider` / `model_provider_id`, or an agent's provider key. It is
+	// routing configuration, NOT a billing subject and NOT a model vendor — the string is chosen by
+	// whoever wrote the config, so it may be "openai", "local_codex" or "mimo2codex-kimi-coding".
+	//
+	// EMPTY MEANS THE PRODUCER RECORDED NONE, and must stay empty when it did. Claude Code writes no
+	// endpoint anywhere in its transcript; this scanner used to stamp "anthropic" on every claude
+	// fact and that value was invented here, not observed. Consumers cross-check it against the
+	// model id (see usage/attribution.go), so an invented value is not inert — it reads as a
+	// contradiction and moves real money to the wrong vendor.
+	Provider string `json:"provider,omitempty"`
 	SessionID       string `json:"session_id,omitempty"`
 	WorkItemID      string `json:"work_item_id,omitempty"`
 	AgentInstanceID string `json:"agent_instance_id,omitempty"`
@@ -714,8 +724,17 @@ func ScanClaudeRequestUsageIncremental(path string, cursor ClaudeRequestCursor) 
 						}
 						fact := byID[id]
 						if fact == nil {
+							// No provider. Claude Code does not record which endpoint it dialled —
+							// ANTHROPIC_BASE_URL can point at a Coding Plan relay and the transcript
+							// looks identical — so "anthropic" was a value invented here, and it is
+							// exactly the mistake the codex branch of this file refuses to make a few
+							// hundred lines up. It was never harmless: a consumer that cross-checks
+							// the endpoint against the model id reads glm-5.3 answered by Anthropic
+							// as a contradiction, and files 625 measured GLM rows under the wrong
+							// vendor. The model id is the trustworthy witness on this runtime; the
+							// honest record of the endpoint is that there isn't one.
 							fact = &ModelRequestUsage{
-								ID: id, Runtime: "claude", Provider: "anthropic", SessionID: sessionID,
+								ID: id, Runtime: "claude", SessionID: sessionID,
 								Model: msg.Model, At: at, StartedAt: timePtrUnlessZero(startedAt), FirstObservedAt: timePtrUnlessZero(at), EndedAt: timePtrUnlessZero(at),
 								SourceRef: filepath.Base(path), SourceOffset: lineOffset,
 								Coverage: RequestCoverage{

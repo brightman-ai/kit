@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"os/exec"
+	"sort"
 	"strings"
 	"time"
 )
@@ -115,19 +116,113 @@ type RuntimeHealth struct {
 	Version string `json:"version,omitempty"`
 }
 
-// QuotaGroup is one independently-accounted limit family. A runtime can expose several
-// account families at once (for example Codex "premium" and "codex"); each group therefore
-// owns its windows and provenance. They must never be spliced together or replace one another.
+// QuotaGroup is one independently-accounted limit family. An account can expose several
+// families at once (the codex account pool plus a per-model metered feature); each group
+// therefore owns its windows and provenance. They must never be spliced together or replace
+// one another.
 type QuotaGroup struct {
-	Family   string        `json:"family,omitempty"`
-	Windows  []QuotaWindow `json:"windows,omitempty"`
-	Snapshot *SnapshotMeta `json:"snapshot,omitempty"`
+	Family string `json:"family,omitempty"`
+	// FamilyLabel is what to render; Family stays the merge key.
+	FamilyLabel string        `json:"family_label,omitempty"`
+	Windows     []QuotaWindow `json:"windows,omitempty"`
+	Snapshot    *SnapshotMeta `json:"snapshot,omitempty"`
 }
 
-// QuotaInfo describes the quota state for one runtime, along the four axes above.
+// Credits is the vendor's OWN consumption unit for the current window — how much was actually
+// spent, as opposed to what fraction is gone.
+//
+// It exists only for vendors that meter this way (OpenAI does; Kimi meters in window percentage
+// and reports nil here). It is always READ from the vendor, never computed: measured against the
+// account API across six days, a local rate-card computation came out exactly 2.5× low every
+// day, because the Fast speed multiplier is not reliably recorded in transcripts. A number that
+// is wrong by a constant factor is more dangerous than no number, because it looks right.
+//
+// # There is deliberately no "allowance" here
+//
+// This type used to publish a whole-window budget, reverse-derived as spend ÷ used-fraction, and
+// it was WRONG — not imprecise, wrong, by a factor of nearly four. Two complete windows measured
+// on one account:
+//
+//	prev window (figures redacted): reached 100%, ~63k credits consumed → ~630 per point
+//	this window:               at 6%,               ~1k credits consumed  → ~167 per point
+//
+// The derivation assumes credits and the rate-limit percentage move together. Those two windows
+// disagree by 3.78×, so they do not, and no ranking of "which window to divide" can rescue it.
+// (A second defect compounded it: the daily ledger settles for the current day with a lag of tens
+// of minutes — the same activity read ~0.3k credits at one instant and ~1k twenty minutes later — so an early
+// division also divides a numerator that has not finished arriving.)
+//
+// What the vendor DOES state exactly is kept, and nothing else is invented:
+//
+//	the percentage window  — "how much of the budget is gone", the vendor's own meter
+//	Used                   — "how much was spent", the vendor's own ledger
+//	PriorWindow            — the same ledger over the previous window, as history
+//
+// "How much is left" already has an exact answer in the percentage. Restating it in credits
+// required a budget that cannot be measured, and inventing one produced「剩 4,716」on an account
+// whose previous week had run to 63,025.
+type Credits struct {
+	// Used is the spend inside the current window.
+	Used float64 `json:"used"`
+	// PriorWindow is what the PREVIOUS window consumed, end to end. A plain sum of the vendor's
+	// own daily figures — no division, no inference — kept as the honest answer to "roughly how
+	// many credits does a week of my work take?".
+	//
+	// It is HISTORY, not this window's budget, and the UI must not present it as one. See the
+	// type comment for why no budget is published at all.
+	PriorWindow float64 `json:"prior_window,omitempty"`
+	// PriorWindowStart is when that previous window opened (ISO-8601), so the figure can be
+	// labelled with the dates it actually covers instead of floating free.
+	PriorWindowStart string `json:"prior_window_start,omitempty"`
+	// Source is CreditsSourceAPI — the field exists so a future estimated source can never be
+	// mistaken for this one.
+	Source string `json:"source"`
+	// WindowStart is the instant the current window opened (ISO-8601).
+	WindowStart string `json:"window_start,omitempty"`
+	// Days is how many daily aggregates went into Used.
+	Days int `json:"days,omitempty"`
+	// WholeDays is false when the window opened mid-day: the vendor aggregates by calendar day,
+	// so the first day's total also contains spend from BEFORE this window. Used then
+	// over-counts, and says so rather than guessing an intra-day split.
+	//
+	// NO omitempty. The informative value here is FALSE, and omitempty deletes exactly that one —
+	// so the caveat this field exists to raise never reached the UI at all (verified on a live
+	// window that opened at 11:23: the wire carried no `whole_days` and the「≈」never appeared).
+	// A boolean whose false is the warning must always be on the wire.
+	WholeDays bool `json:"whole_days"`
+}
+
+// CreditsSourceAPI marks credits read from the vendor's own accounting.
+const CreditsSourceAPI = "api"
+
+// Attribution answers "is the traffic I am producing right now billed to THIS account?".
+//
+// It exists because one runtime can serve several vendors: point codex at a translating proxy
+// and every session still lands in ~/.codex/sessions, but the bill goes elsewhere. Without this,
+// the official row can only sit there looking stale while the user is, correctly, not spending
+// anything on it. nil ⟹ the question does not apply, or we cannot answer it — and "unknown" is
+// never rendered as "no".
+type Attribution struct {
+	// Active is true when the newest session on this host was billed to this account.
+	Active bool `json:"active"`
+	// Vendor names who IS being billed, when that is knowable.
+	Vendor  string `json:"vendor,omitempty"`
+	Display string `json:"display,omitempty"`
+	// ProviderID is the raw identifier we could not map — a runtime-side provider id for codex,
+	// a model id for claude. Showing the string the user would recognise beats showing 「其他」.
+	ProviderID string `json:"provider_id,omitempty"`
+}
+
+// QuotaInfo describes the quota state for one ACCOUNT, along the four axes above.
 type QuotaInfo struct {
 	// Runtime is the CLI name: "claude", "codex", "gemini".
 	Runtime string `json:"runtime"`
+	// Vendor is who is billed. Runtime+Vendor is the account's identity — the list key, and the
+	// reason two rows can share a runtime.
+	Vendor string `json:"vendor,omitempty"`
+	// Display is the vendor's invoice name, served from the domain so adding a vendor needs no
+	// frontend change.
+	Display string `json:"display,omitempty"`
 
 	// ── axis 1: account presence (the only axis allowed to hide a provider)
 	Present bool `json:"present"`
@@ -150,9 +245,36 @@ type QuotaInfo struct {
 	// QuotaGroups is the lossless view: one latest whole reading per family. Family/Windows/
 	// Snapshot above remain the globally-newest compatibility projection for old consumers.
 	QuotaGroups []QuotaGroup `json:"quota_groups,omitempty"`
+	// Credits is what was actually spent this window, for vendors that meter that way.
+	Credits *Credits `json:"credits,omitempty"`
 
 	// ── axis 4: runtime health
 	Health RuntimeHealth `json:"health"`
+	// CanProbe says whether this account can be asked for a live reading. It is served rather
+	// than inferred because the UI's only alternative is to hardcode which runtimes answer —
+	// which was already wrong the moment a second vendor appeared behind the same CLI.
+	CanProbe bool `json:"can_probe"`
+
+	// Endpoints lists the runtime-side endpoint ids this SUBSCRIPTION is reached through — the
+	// values the host declared in Credential.RuntimeProviderIDs (e.g. "mimo2codex-kimi-coding").
+	//
+	// It is published so a surface can tell one vendor's SUBSCRIPTION traffic from that same
+	// vendor's pay-per-token traffic. Holding both at once is ordinary — a Kimi plan and a
+	// Moonshot API key — and without this the two are indistinguishable, because codex records a
+	// billing mode only for Fast turns and claude records none at all, so nearly every row says
+	// "unknown". Matching on the endpoint is evidence; matching on the vendor alone is a guess
+	// that quietly files metered spend under a subscription.
+	//
+	// EMPTY means "not reached through any declared endpoint" — a first-party plan (the CLI's own
+	// login), which covers that vendor's traffic wholesale. Absence is therefore NOT "covers
+	// nothing"; consumers must read it as "no endpoint restriction".
+	//
+	// These are names the user chose in their own config and are already shown on the report row;
+	// nothing secret is added here.
+	Endpoints []string `json:"endpoints,omitempty"`
+
+	// Attribution says whether this account is the one currently being billed.
+	Attribution *Attribution `json:"attribution,omitempty"`
 
 	// Note is a human-readable supplementary message.
 	Note string `json:"note,omitempty"`
@@ -211,11 +333,12 @@ func quotaGroupFromReading(r *Reading) QuotaGroup {
 	// Copy before stamping expiry/inference: callers may reuse a Reading in another projection,
 	// and query-time metadata must not mutate the source observation.
 	windows := append([]QuotaWindow(nil), r.Windows...)
-	windows = dedupeWindows(windows)
+	windows = orderWindows(dedupeWindows(windows))
 	return QuotaGroup{
-		Family:   r.Family,
-		Windows:  windows,
-		Snapshot: newSnapshotMeta(r, windows),
+		Family:      r.Family,
+		FamilyLabel: r.FamilyLabel,
+		Windows:     windows,
+		Snapshot:    newSnapshotMeta(r, windows),
 	}
 }
 
@@ -238,6 +361,38 @@ func dedupeWindows(windows []QuotaWindow) []QuotaWindow {
 		out = append(out, w)
 	}
 	return out
+}
+
+// windowKind labels a window by its LENGTH — the single definition, because three vendors now
+// report windows and a label invented per-vendor is how "7天" ends up on a monthly budget.
+// 0 minutes means the vendor never stated a length; there is then nothing to call it.
+func windowKind(minutes int) string {
+	switch {
+	case minutes <= 0:
+		return ""
+	case minutes <= 300:
+		return "5h"
+	case minutes <= 7*24*60:
+		return "7d"
+	default:
+		return "30d"
+	}
+}
+
+// orderWindows puts the shortest window first, so every vendor's row reads in the same order
+// (5小时 then 7天) no matter what order that vendor happened to list them in. Two rows in one
+// panel disagreeing about which bar comes first makes the reader re-parse each one — a cost paid
+// on every glance, to save a sort that happens once. A window with no stated length sorts last:
+// it cannot claim a position in a sequence it has no place in.
+func orderWindows(windows []QuotaWindow) []QuotaWindow {
+	sort.SliceStable(windows, func(i, j int) bool {
+		a, b := windows[i].WindowMinutes, windows[j].WindowMinutes
+		if a == 0 || b == 0 {
+			return b == 0 && a != 0
+		}
+		return a < b
+	})
+	return windows
 }
 
 // newSnapshotMeta stamps a reading with its age, its provenance, and whether it survives.
@@ -338,17 +493,23 @@ func probeCLI(name string) RuntimeHealth {
 
 type claudeProvider struct{}
 
-func (claudeProvider) Runtime() string { return "claude" }
+func (claudeProvider) Account() Account {
+	return Account{Runtime: "claude", Vendor: VendorAnthropic}
+}
 
-// CanProbe is false: claude exposes its 5h/7d usage ONLY as a field of the JSON it pipes to a
-// statusLine command. There is no endpoint to ask — the reading arrives when claude renders.
-func (claudeProvider) CanProbe() bool                { return false }
+// ProbeCost is ProbeNone: claude exposes its 5h/7d usage ONLY as a field of the JSON it pipes to
+// a statusLine command. There is no endpoint to ask — the reading arrives when claude renders.
+func (claudeProvider) ProbeCost() string             { return ProbeNone }
 func (claudeProvider) Probe(_ context.Context) error { return nil }
 
 // Query assembles claude's four axes. Presence comes from account artifacts (credentials /
 // captured reading / project history) — NOT from the CLI probe.
-func (claudeProvider) Query() QuotaInfo {
-	info := QuotaInfo{Runtime: "claude", Health: probeCLI("claude")}
+func (p claudeProvider) Query() QuotaInfo {
+	account := p.Account()
+	info := QuotaInfo{
+		Runtime: account.Runtime, Vendor: account.Vendor, Display: account.Display(),
+		Health: probeCLI(account.Runtime), CanProbe: p.ProbeCost() != ProbeNone,
+	}
 
 	reading := claudeHookReading()
 	info.Evidence = claudePresenceEvidence(reading != nil)
@@ -363,6 +524,7 @@ func (claudeProvider) Query() QuotaInfo {
 		return info
 	}
 
+	info.Attribution = claudeAttribution(account)
 	info.applyReading(reading)
 	if info.Billing == BillingAPI {
 		info.Note = "API 计费会话 · 按量付费（无订阅额度窗口）"
@@ -376,37 +538,40 @@ func (claudeProvider) Query() QuotaInfo {
 
 type codexProvider struct{}
 
-func (codexProvider) Runtime() string { return "codex" }
+func (codexProvider) Account() Account {
+	return Account{Runtime: "codex", Vendor: VendorOpenAI}
+}
 
-// CanProbe is true when the account is OAuth-authenticated: only then is there a token to ask
-// with. An API-key account has no subscription quota to report in the first place.
-func (codexProvider) CanProbe() bool {
-	_, err := codexAccessToken()
-	return err == nil
+// ProbeCost is ProbeFree when the account is OAuth-authenticated: only then is there a token to
+// ask with, and asking is a plain read. An API-key account has no subscription quota at all.
+func (codexProvider) ProbeCost() string {
+	if _, _, err := codexCredentials(); err != nil {
+		return ProbeNone
+	}
+	return ProbeFree
 }
 
 func (codexProvider) Probe(ctx context.Context) error { return probeCodexQuota(ctx) }
 
 // Query assembles codex's four axes from the freshest available reading PER FAMILY: rollout
-// observations codex writes as it works, plus the drop file our probe writes when asked.
-func (codexProvider) Query() QuotaInfo {
-	info := QuotaInfo{Runtime: "codex", Health: probeCLI("codex")}
-
-	rolloutReadings := codexRolloutReadings()
-	probeReading := codexProbeReading()
-	// Snapshots written before Family existed cannot form a trustworthy second bucket. Attach
-	// them to the newest observed account family so the upgrade preserves the old age-wins rule.
-	if probeReading != nil && probeReading.Family == "" {
-		if latestRollout := newestReading(rolloutReadings...); latestRollout != nil {
-			probeReading.Family = latestRollout.Family
-		}
+// observations codex writes as it works, plus the snapshot our probe stores when it asks.
+func (p codexProvider) Query() QuotaInfo {
+	account := p.Account()
+	info := QuotaInfo{
+		Runtime: account.Runtime, Vendor: account.Vendor, Display: account.Display(),
+		Health: probeCLI(account.Runtime), CanProbe: p.ProbeCost() != ProbeNone,
 	}
-	readings := newestReadingsByFamily(append(rolloutReadings, probeReading)...)
+
+	rolloutReadings := codexRolloutScan()
+	snapshotReadings, credits := readSnapshotReadings(account)
+	readings := newestReadingsByFamily(append(rolloutReadings, snapshotReadings...)...)
+
 	info.Evidence = codexPresenceEvidence(len(readings) > 0)
 	info.Present = len(info.Evidence) > 0
 	if !info.Present {
 		return info
 	}
+	info.Attribution = codexAttribution(account, codexBilledToProvider())
 
 	// Billing is knowable from the auth file's SHAPE (an API key vs an OAuth token set) — we
 	// look at which field is populated, never at its value.
@@ -422,28 +587,53 @@ func (codexProvider) Query() QuotaInfo {
 	}
 
 	info.applyReadings(readings)
+	info.Credits = credits
 	switch readings[0].Source {
 	case SourceProbe:
-		info.Note = "账号额度 · 实时查询"
+		info.Note = "账号额度 · 官方接口"
 	default:
 		info.Note = "账号额度来自 rollout transcript"
 	}
 	return info
 }
 
+// codexAttribution reports whether the newest codex session on this host was billed to `account`.
+// billedTo is the raw session_meta.model_provider of that session; empty means an older rollout
+// that predates the field, which by definition talked to OpenAI itself.
+func codexAttribution(account Account, billedTo string) *Attribution {
+	current := VendorOpenAI
+	if billedTo != "" && billedTo != codexOwnProvider {
+		current = vendorForRuntimeProvider(billedTo)
+	}
+	attribution := &Attribution{Active: current == account.Vendor, Vendor: current}
+	if current != "" {
+		attribution.Display = Account{Runtime: account.Runtime, Vendor: current}.Display()
+	} else {
+		// Nobody claimed this provider id. Name it anyway — the id the user configured is more
+		// informative than a shrug, and it is the string they will recognise.
+		attribution.ProviderID = billedTo
+	}
+	return attribution
+}
+
 // ── gemini ───────────────────────────────────────────────────────────────────
 
 type geminiProvider struct{}
 
-func (geminiProvider) Runtime() string               { return "gemini" }
-func (geminiProvider) CanProbe() bool                { return false }
+func (geminiProvider) Account() Account {
+	return Account{Runtime: "gemini", Vendor: VendorGoogle}
+}
+func (geminiProvider) ProbeCost() string             { return ProbeNone }
 func (geminiProvider) Probe(_ context.Context) error { return nil }
 
 // Query always reports absent: Gemini quota parsing is not supported, and not_implemented must
 // never masquerade as a supported-but-empty provider.
-func (geminiProvider) Query() QuotaInfo {
+func (p geminiProvider) Query() QuotaInfo {
+	account := p.Account()
 	return QuotaInfo{
-		Runtime: "gemini",
+		Runtime: account.Runtime,
+		Vendor:  account.Vendor,
+		Display: account.Display(),
 		Present: false,
 		Health:  RuntimeHealth{OK: false, Reason: HealthNotImplemented},
 		Note:    "Gemini quota inspection is not yet supported",

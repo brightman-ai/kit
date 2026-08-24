@@ -761,8 +761,15 @@ func idFromRolloutName(name string) string {
 // CodexModelUsage is one per-turn token-usage delta tagged with the model that
 // was active for that turn (a session may switch models mid-conversation).
 type CodexModelUsage struct {
-	At              time.Time
-	Model           string
+	At    time.Time
+	Model string
+	// Provider is the endpoint this session dialled, in codex's own vocabulary ("openai",
+	// "mimo2codex-kimi-coding"). Empty when the rollout records none, which older ones do not.
+	//
+	// It is carried because the model id alone cannot say whose bill a turn lands on: a relay can
+	// pass the upstream's id straight through, so `gpt-5.6-sol` has been observed on traffic billed
+	// to Moonshot. Callers cross-check the two; this scanner only reports what was written.
+	Provider        string
 	InputTokens     int // fresh/uncached input; cached input is separate below
 	OutputTokens    int
 	CacheReadTokens int
@@ -792,8 +799,9 @@ func ScanCodexModelUsage(path string) ([]CodexModelUsage, error) {
 	defer f.Close()
 
 	var (
-		model  string
-		events []CodexModelUsage
+		model    string
+		provider string
+		events   []CodexModelUsage
 	)
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 1<<20), 64<<20) // rollout lines can be large
@@ -803,11 +811,36 @@ func ScanCodexModelUsage(path string) ([]CodexModelUsage, error) {
 			continue
 		}
 		switch line.Type {
+		case "session_meta":
+			// The thread's own declaration of where it runs, written as the FIRST line. A
+			// `codex exec` rollout states it here and nowhere else.
+			if meta := line.asSessionMeta(); meta != nil && meta.ModelProvider != "" {
+				provider = meta.ModelProvider
+			}
 		case "turn_context":
 			if tc := line.asTurnContext(); tc != nil && tc.Model != "" {
 				model = tc.Model
 			}
 		case "event_msg":
+			// A mid-session switch re-states both the model and the endpoint; taking one without
+			// the other would pair a new model id with a stale provider.
+			if line.payloadType() == "thread_settings_applied" {
+				var p struct {
+					ThreadSettings struct {
+						Model           string `json:"model"`
+						ModelProviderID string `json:"model_provider_id"`
+					} `json:"thread_settings"`
+				}
+				if json.Unmarshal(line.Payload, &p) == nil {
+					if p.ThreadSettings.Model != "" {
+						model = p.ThreadSettings.Model
+					}
+					if p.ThreadSettings.ModelProviderID != "" {
+						provider = p.ThreadSettings.ModelProviderID
+					}
+				}
+				continue
+			}
 			if line.payloadType() != "token_count" {
 				continue
 			}
@@ -822,6 +855,7 @@ func ScanCodexModelUsage(path string) ([]CodexModelUsage, error) {
 			events = append(events, CodexModelUsage{
 				At:              line.time(),
 				Model:           model,
+				Provider:        provider,
 				InputTokens:     intField(u, "input_tokens"),
 				OutputTokens:    intField(u, "output_tokens"),
 				CacheReadTokens: intField(u, "cache_read_input_tokens"),

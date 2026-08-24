@@ -98,13 +98,22 @@ var priceTable = []priceEntry{
 	{"deepseek-v4-pro", ModelPrice{Tier: Tier{0.435, 0.87, 0.003625, 0, 0}, Currency: "USD"}},
 	{"deepseek-chat", ModelPrice{Tier: Tier{0.28, 0.42, 0.028, 0, 0}, Currency: "USD"}},
 
-	// ── Zhipu / GLM (CNY per MILLION tokens; no cache-write tier) ───────────────
-	// open.bigmodel.cn/pricing, read 2026-08-05. Exact ids only — the generic "glm"
-	// key that used to sit here was a family fallback at ¥5/¥5 whose output rate was
-	// 5.6× under the current flagship, and being generic it would have applied that
-	// to every future GLM. Same rule OpenAI and Anthropic follow above, same reason.
-	{"glm-5.2", ModelPrice{Tier: Tier{8, 28, 2, 0, 0}, Currency: "CNY"}},
-	{"glm-5.1", ModelPrice{Tier: Tier{6, 24, 1.3, 0, 0}, Currency: "CNY"}},
+	// ── Zhipu / GLM — moved to the CATALOG (see catalogRules) ──────────────────
+	// glm-5.2 and glm-5.1 used to sit here as flat prices. Both had to move, for two
+	// reasons this table cannot serve:
+	//
+	//   - MOST GLM MODELS ARE BANDED. Zhipu prices by input length, and GLM-4.7 /
+	//     GLM-4.5-Air by output length as well. glm-5.1 was carried here as ¥6/¥24 —
+	//     its SHORT band only — so every request over 32k tokens was under-charged by
+	//     a third against the ¥8/¥28 the vendor actually lists.
+	//   - PROVENANCE. A curated row here carries no sourceURL and inherits the whole
+	//     table's snapshot date; a catalog rule states the page it was read from and
+	//     the day a human read it. For a vendor whose page is a SPA that serves no
+	//     prices to a plain fetch, that difference is the difference between a number
+	//     someone can re-check and one they cannot.
+	//
+	// Nothing is lost by the move: the catalog is asked FIRST, so these ids resolve
+	// exactly as before, only banded and with their provenance attached.
 
 	// ── Removed rather than left stale ─────────────────────────────────────────
 	// "qwen" / "qwen-max" carried ¥0.8/¥2 and ¥2.4/¥9.6 from an unrecorded vintage,
