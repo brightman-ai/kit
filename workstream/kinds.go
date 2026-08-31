@@ -29,6 +29,50 @@ func AllKinds() []Kind {
 	return kinds
 }
 
+// AllTaskStatuses returns every TaskItem.Status value this package defines, in
+// lifecycle order (未开始 → 进行中 → 三种终态).
+//
+// 与 AllKinds() 同一个理由：枚举必须有一个**程序读得到**的答案，否则消费端只能靠人肉
+// grep 对齐，而人肉对齐必然漂移。两道闸：kinds_test.go 扫 event.go 的常量声明与本列表
+// 比对（漏登记就红）；Manifest() 把它导出给跨语言消费端断言（例如 TypeScript 前端可以
+// 用一个跨语言对账测试读本包源码，核对它那份联合类型与这里一致）。
+//
+// 顺序是语义（生命周期），不排序 —— 与 AllKinds() 的字典序不同，那里顺序无意义。
+func AllTaskStatuses() []string {
+	return []string{
+		TaskStatusPending,
+		TaskStatusInProgress,
+		TaskStatusCompleted,
+		TaskStatusFailed,
+		TaskStatusCancelled,
+	}
+}
+
+// TaskStatusTerminal reports whether a step will never change again.
+//
+// 三种终态语义不同（成 / 砸了 / 没跑），但"不会再动了"这件事是同一个判断，值得有唯一
+// 出处：生产方据它决定还要不要再发快照，消费端据它给那一行收尾（停掉转圈）。
+func TaskStatusTerminal(status string) bool {
+	switch status {
+	case TaskStatusCompleted, TaskStatusFailed, TaskStatusCancelled:
+		return true
+	default:
+		return false
+	}
+}
+
+// KnownTaskStatus reports whether status is a registered TaskItem.Status value.
+// 与 Known 同理：区分"我还没实现的档"(已登记 = 消费端的 bug) 与"线上的垃圾"(未登记 =
+// 生产方 bug 或版本错位)。
+func KnownTaskStatus(status string) bool {
+	for _, s := range AllTaskStatuses() {
+		if s == status {
+			return true
+		}
+	}
+	return false
+}
+
 // Known reports whether k is a registered Kind. Consumers that must not silently
 // drop unknown events use this to tell "a Kind I haven't implemented yet"
 // (registered but unhandled — a bug in the consumer) apart from "garbage on the
@@ -50,5 +94,9 @@ func Manifest() map[string]any {
 	for i, k := range kinds {
 		names[i] = string(k)
 	}
-	return map[string]any{"kinds": names}
+	// task_statuses 是**新增**键，老消费端只读 "kinds"，不受影响。
+	return map[string]any{
+		"kinds":         names,
+		"task_statuses": AllTaskStatuses(),
+	}
 }
