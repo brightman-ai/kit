@@ -99,11 +99,43 @@ type TaskData struct {
 	Status string     `json:"status,omitempty"`
 }
 
+// TaskItem is one step of a plan the user watches progress through.
+//
+// Status 取值见下方 TaskStatus* 常量（登记表 AllTaskStatuses()）。
+//
+// 字段类型保持 string 而非具名类型。**不是**因为字面量赋不进具名类型 —— 无类型字符串
+// 字面量赋给具名 string 类型完全合法（`Item{Status: "pending"}` 编译得过）。真正会断的是
+// 生产方那些把 `status string` **变量**在函数间传递的地方：变量赋给具名类型需要显式转换，
+// 一改就编译不过。为一个枚举去打断下游的构建，不划算。
+//
+// 常量是**无类型**字符串常量，所以既能赋给本字段，也能逐步替换掉散落各处的字面量。
 type TaskItem struct {
 	ID      string `json:"id,omitempty"`
 	Content string `json:"content"`
-	Status  string `json:"status"` // pending | in_progress | completed
+	Status  string `json:"status"` // 见 TaskStatus* / AllTaskStatuses()
 }
+
+// 计划步骤的状态取值。此前这个枚举只活在 TaskItem.Status 后面的一行注释里 —— 也就是说
+// 它**不存在于任何机器可读的地方**：这一侧是裸 string，而消费端（如 TypeScript 前端）
+// 往往把它写成一个真联合类型，两边没有任何东西把它们绑住。加一档而消费端没跟上，前端的
+// 兜底分支会把它画成"还没开始"，不报错、不留痕、屏幕上说假话 —— 与 Kind 当初要解决的
+// 漂移是同一种病。
+//
+// 生命周期顺序：Pending → InProgress → 三种终态之一。
+const (
+	TaskStatusPending    = "pending"
+	TaskStatusInProgress = "in_progress"
+
+	// TaskStatusCompleted 这一步做成了。
+	TaskStatusCompleted = "completed"
+	// TaskStatusFailed 这一步跑了但没成。补这一档之前，生产方遇到步骤失败只有两条路：
+	// 让它停在 in_progress（前端那一行永远转圈 = 撒谎说还在跑），或者标成 completed
+	// （撒谎说成了）。已有消费者正因此受阻。
+	TaskStatusFailed = "failed"
+	// TaskStatusCancelled 这一步没跑（整轮被中断/上游取消）。与 Failed 分开：没跑不等于
+	// 跑砸了，把两者塞进同一个值，用户就无从判断该重试还是该改方案。
+	TaskStatusCancelled = "cancelled"
+)
 
 type ArtifactData struct {
 	ID          string `json:"id,omitempty"`
