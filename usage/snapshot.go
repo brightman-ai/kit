@@ -42,6 +42,48 @@ type quotaSnapshot struct {
 	// one. nil ⟹ this vendor does not meter in credits (Kimi meters in window percentage), or
 	// the vendor has not aggregated the current window yet.
 	Credits *Credits `json:"credits,omitempty"`
+	// LastProbeAt / LastProbeError remember the most recent PROBE outcome when that probe
+	// FAILED (a successful probe's outcome is CapturedAt itself). A failed probe must not
+	// erase the last-known windows, but its REASON must survive — "账号未返回可用额度窗口"
+	// (subscription likely lapsed) is actionable information the stale badge was flattening
+	// into a generic "数据已过期". Kept alongside the families precisely so the UI can show
+	// "still showing the reading from X because the account said Y".
+	LastProbeAt    int64  `json:"last_probe_at,omitempty"`
+	LastProbeError string `json:"last_probe_error,omitempty"`
+}
+
+// recordProbeFailure persists a failed probe's reason WITHOUT touching the last-known windows:
+// the failure is a fact about NOW, the windows are facts about THEN, and overwriting one with
+// the other is how "8 天前的数字" loses its explanation. Absent file → a bare error record
+// (the account existed long enough to be probed; that is worth remembering too).
+func recordProbeFailure(a Account, at time.Time, msg string) {
+	path := snapshotPath(a)
+	var snap quotaSnapshot
+	if data, err := os.ReadFile(path); err == nil {
+		_ = json.Unmarshal(data, &snap)
+	}
+	snap.Account = a
+	snap.LastProbeAt = at.Unix()
+	snap.LastProbeError = msg
+	_ = writeSnapshot(snap)
+}
+
+// lastProbeFailure reads the persisted probe-failure reason, if any and recent enough to be
+// worth saying (a failure from last month explains nothing about today's number).
+func lastProbeFailure(a Account, maxAge time.Duration) (at time.Time, msg string) {
+	data, err := os.ReadFile(snapshotPath(a))
+	if err != nil {
+		return time.Time{}, ""
+	}
+	var snap quotaSnapshot
+	if json.Unmarshal(data, &snap) != nil || snap.LastProbeError == "" || snap.LastProbeAt <= 0 {
+		return time.Time{}, ""
+	}
+	t := time.Unix(snap.LastProbeAt, 0)
+	if time.Since(t) > maxAge {
+		return time.Time{}, ""
+	}
+	return t, snap.LastProbeError
 }
 
 // snapshotPath is where one account's probe result lives.
@@ -51,6 +93,7 @@ func snapshotPath(a Account) string {
 
 // writeSnapshot persists a probe result so the OFFLINE path sees it too.
 func writeSnapshot(snap quotaSnapshot) error {
+	snap.LastProbeAt, snap.LastProbeError = 0, "" // a successful capture supersedes any older failure
 	path := snapshotPath(snap.Account)
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
@@ -93,6 +136,11 @@ func readSnapshotReadings(a Account) ([]*Reading, *Credits) {
 		})
 	}
 	return readings, snap.Credits
+}
+
+// readSnapshotProbeFailure surfaces the persisted last-probe failure for one account.
+func readSnapshotProbeFailure(a Account) (time.Time, string) {
+	return lastProbeFailure(a, 48*time.Hour)
 }
 
 func orDefault(v, fallback string) string {

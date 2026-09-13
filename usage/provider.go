@@ -140,7 +140,13 @@ func QueryAllQuotas() []QuotaInfo {
 	all := providers()
 	out := make([]QuotaInfo, 0, len(all))
 	for _, p := range all {
-		out = append(out, p.Query())
+		info := p.Query()
+		// A persisted probe failure explains a number that stopped moving. Attached HERE (not
+		// inside each provider's Query) so every account gets it without five copies.
+		if at, msg := readSnapshotProbeFailure(p.Account()); msg != "" {
+			info.LastProbeError, info.LastProbeAt = msg, at.UTC().Format(time.RFC3339)
+		}
+		out = append(out, info)
 	}
 	return out
 }
@@ -199,6 +205,7 @@ func probeMatching(ctx context.Context, want func(QuotaProvider) bool) []ProbeRe
 		}
 		if err := p.Probe(ctx); err != nil {
 			result.Status, result.Reason = ProbeFailed, err.Error()
+			recordProbeFailure(account, time.Now(), err.Error())
 			out = append(out, result)
 			continue
 		}

@@ -164,13 +164,40 @@ type QuotaGroup struct {
 type Credits struct {
 	// Used is the spend inside the current window.
 	Used float64 `json:"used"`
-	// PriorWindow is what the PREVIOUS window consumed, end to end. A plain sum of the vendor's
-	// own daily figures — no division, no inference — kept as the honest answer to "roughly how
-	// many credits does a week of my work take?".
+	// PriorWindow is what the span before this cycle consumed. A plain sum of the vendor's own
+	// daily figures — no division, no inference — kept as the honest answer to "roughly how many
+	// credits does a week of my work take?".
 	//
 	// It is HISTORY, not this window's budget, and the UI must not present it as one. See the
 	// type comment for why no budget is published at all.
 	PriorWindow float64 `json:"prior_window,omitempty"`
+	// PriorIsCycle says whether PriorWindow covers an actual billing CYCLE, or merely the span
+	// of one window length before this cycle began.
+	//
+	// They differ whenever a cycle ended EARLY — codex sells a "reset card" that restarts the
+	// weekly window on the spot, and this account used one on 2026-09-05 after running to 100%.
+	// A cycle cut short is shorter than a span, so counting one span backwards reaches into the
+	// cycle before it: 08-29 and 08-30 alone were 42k and 38k credits, and whether they belong to
+	// the previous cycle is precisely what nobody can tell from arithmetic. True only when the
+	// boundary was OBSERVED and recorded (cycle.go).
+	//
+	// NO omitempty. False is the value that carries the warning, and omitempty deletes exactly
+	// the false — the identical mistake this file already made with WholeDays, where the「≈」it
+	// existed to raise never once reached the UI.
+	PriorIsCycle bool `json:"prior_is_cycle"`
+	// SettledThrough is the last day inside this window whose figure the vendor has finished
+	// writing (empty ⟹ not one day in the window has settled).
+	SettledThrough string `json:"settled_through,omitempty"`
+	// UnsettledDays is how many days inside Used the vendor is still writing.
+	//
+	// Used mixes settled history with a day that is not finished, and without this number there
+	// is no way to tell "spent almost nothing" from "the ledger has not caught up". Measured
+	// 2026-09-05: a one-day-old window read 1,153.45 credits against 0 turns while the meter
+	// climbed 65% → 74% — the figure was 100% unsettled and looked like a small bill.
+	//
+	// NO omitempty, same rule as PriorIsCycle: zero is the value that means "this number is
+	// trustworthy", and it is the one omitempty removes.
+	UnsettledDays int `json:"unsettled_days"`
 	// PriorWindowStart is when that previous window opened (ISO-8601), so the figure can be
 	// labelled with the dates it actually covers instead of floating free.
 	PriorWindowStart string `json:"prior_window_start,omitempty"`
@@ -278,6 +305,13 @@ type QuotaInfo struct {
 
 	// Note is a human-readable supplementary message.
 	Note string `json:"note,omitempty"`
+	// LastProbeError is the reason the most recent PROBE failed (within its freshness horizon),
+	// persisted across restarts next to the reading it failed to refresh. It explains why a
+	// stale number stopped moving — "the account returned no quota windows" (subscription
+	// lapsed) is actionable; a bare "数据已过期" is not.
+	LastProbeError string `json:"last_probe_error,omitempty"`
+	// LastProbeAt is when that failing probe ran (RFC3339).
+	LastProbeAt string `json:"last_probe_at,omitempty"`
 }
 
 // maxSnapshotAge bounds how long a reading with no checkable reset time stays
@@ -571,7 +605,7 @@ func (p codexProvider) Query() QuotaInfo {
 	if !info.Present {
 		return info
 	}
-	info.Attribution = codexAttribution(account, codexBilledToProvider())
+	info.Attribution = codexAttribution(account)
 
 	// Billing is knowable from the auth file's SHAPE (an API key vs an OAuth token set) — we
 	// look at which field is populated, never at its value.
@@ -600,20 +634,15 @@ func (p codexProvider) Query() QuotaInfo {
 // codexAttribution reports whether the newest codex session on this host was billed to `account`.
 // billedTo is the raw session_meta.model_provider of that session; empty means an older rollout
 // that predates the field, which by definition talked to OpenAI itself.
-func codexAttribution(account Account, billedTo string) *Attribution {
-	current := VendorOpenAI
-	if billedTo != "" && billedTo != codexOwnProvider {
-		current = vendorForRuntimeProvider(billedTo)
+// codexAttribution answers "is the traffic codex is producing right now billed to THIS account?"
+// over the windowed set of active endpoints — see claudeAttribution for why a set rather than the
+// single newest session, and attributionWindow for why "now" is bounded at all.
+func codexAttribution(account Account) *Attribution {
+	vendors := recentCodexVendors(time.Now())
+	if len(vendors) == 0 {
+		return nil
 	}
-	attribution := &Attribution{Active: current == account.Vendor, Vendor: current}
-	if current != "" {
-		attribution.Display = Account{Runtime: account.Runtime, Vendor: current}.Display()
-	} else {
-		// Nobody claimed this provider id. Name it anyway — the id the user configured is more
-		// informative than a shrug, and it is the string they will recognise.
-		attribution.ProviderID = billedTo
-	}
-	return attribution
+	return attributionFromVendors(account, vendors)
 }
 
 // ── gemini ───────────────────────────────────────────────────────────────────
