@@ -310,6 +310,9 @@ type QuotaInfo struct {
 	// stale number stopped moving — "the account returned no quota windows" (subscription
 	// lapsed) is actionable; a bare "数据已过期" is not.
 	LastProbeError string `json:"last_probe_error,omitempty"`
+	// ApiSessions lists provider profiles with a live API-billing session (claude-switch dual
+	// account: official OAuth row + per-profile API sessions coexist). nil when none.
+	ApiSessions []ClaudeAPISession `json:"api_sessions,omitempty"`
 	// LastProbeAt is when that failing probe ran (RFC3339).
 	LastProbeAt string `json:"last_probe_at,omitempty"`
 }
@@ -552,6 +555,10 @@ func (p claudeProvider) Query() QuotaInfo {
 		return info
 	}
 
+	// API profile 会话独立于官方读数存在——官方还没渲染过（bare 文件缺失）不该连带隐藏
+	// 正在跑的 API 会话（实测坑：early return 把 kimi 行一起吞了）。
+	info.ApiSessions = claudeAPISessions(time.Now())
+
 	if reading == nil {
 		info.Billing = BillingUnknown
 		info.Note = claudeNoSnapshotNote(info.Evidence)
@@ -561,6 +568,9 @@ func (p claudeProvider) Query() QuotaInfo {
 	info.Attribution = claudeAttribution(account)
 	info.applyReading(reading)
 	if info.Billing == BillingAPI {
+		// Legacy single-file state (pre-split statusline): the bare file says api because an
+		// API session clobbered it. With per-profile files the bare file returns to
+		// subscription as soon as an official session renders once.
 		info.Note = "API 计费会话 · 按量付费（无订阅额度窗口）"
 	} else {
 		info.Note = "实时额度来自 statusLine hook"

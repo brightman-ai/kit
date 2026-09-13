@@ -16,6 +16,9 @@ import (
 	"bytes"
 	"encoding/json"
 	"os"
+	"path/filepath"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/brightman-ai/kit/pricing"
@@ -96,6 +99,61 @@ func claudeHookReading() *Reading {
 	return r
 }
 
+// ── per-profile API sessions (claude-switch dual-account, 2026-09-13) ────────────────────────
+// The statusline now writes one file PER account: the official OAuth session keeps the bare
+// claude-rate-limits.json (subscription windows), and every provider profile (claude-switch's
+// ~/.claude-profiles/<name>/) gets claude-rate-limits-<name>.json. This reads those profile
+// files so the panel can say "official subscription: X% left · API 会话也在跑: glm, kimi" —
+// both accounts exist at once and both deserve to be seen.
+
+// ClaudeAPISession is one provider profile with a live-ish API-billing reading.
+type ClaudeAPISession struct {
+	Name string `json:"name"`
+	// CapturedAt is RFC3339, the profile's last statusline beat.
+	CapturedAt string `json:"captured_at"`
+	// AgeSeconds is how long ago that beat was.
+	AgeSeconds int64 `json:"age_seconds"`
+}
+
+// claudeAPISessionMaxAge bounds how long a profile file still counts as a live session —
+// statuslines beat every few seconds, so a day-old file is a session that has since closed.
+const claudeAPISessionMaxAge = 24 * time.Hour
+
+func claudeAPISessions(now time.Time) []ClaudeAPISession {
+	matches, err := filepath.Glob(deepworkFile("claude-rate-limits-*.json"))
+	if err != nil || len(matches) == 0 {
+		return nil
+	}
+	out := make([]ClaudeAPISession, 0, len(matches))
+	for _, path := range matches {
+		var f struct {
+			CapturedAt int64  `json:"captured_at"`
+			Source     string `json:"source"`
+			Profile    string `json:"profile"`
+		}
+		data, err := os.ReadFile(path) //nolint:gosec — our own statusline output
+		if err != nil || json.Unmarshal(data, &f) != nil || f.CapturedAt <= 0 {
+			continue
+		}
+		at := time.Unix(f.CapturedAt, 0)
+		if now.Sub(at) > claudeAPISessionMaxAge {
+			continue
+		}
+		name := f.Profile
+		if name == "" {
+			base := filepath.Base(path)
+			name = strings.TrimSuffix(strings.TrimPrefix(base, "claude-rate-limits-"), ".json")
+		}
+		out = append(out, ClaudeAPISession{
+			Name:       name,
+			CapturedAt: at.UTC().Format(time.RFC3339),
+			AgeSeconds: int64(now.Sub(at).Seconds()),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].AgeSeconds < out[j].AgeSeconds })
+	return out
+}
+
 // claudeQuotaWindow maps a claude window onto the unified QuotaWindow (5h/7d).
 func claudeQuotaWindow(kind string, w *claudeRateWindow) (QuotaWindow, bool) {
 	if w == nil {
@@ -129,14 +187,30 @@ func claudeQuotaWindow(kind string, w *claudeRateWindow) (QuotaWindow, bool) {
 // codex session behind a translating proxy, there is nothing to disbelieve.
 
 // claudeAttributionFiles bounds the scan. The newest file is usually the live session, but a
-// sidechain or a just-closed session can sort above it, so look at a few and take the newest
-// assistant row across them.
-const claudeAttributionFiles = 4
+// sidechain or a just-closed session can sort above it, and — the case that broke the old
+// single-newest logic — several panes can be live at once. A host with many terminal sessions
+// easily has more than four recently-touched transcripts, so the bound is generous; the window
+// below is what actually limits the work.
+const claudeAttributionFiles = 16
 
-// claudeBilledToModel returns the model of the newest assistant message across claude's recent
-// transcripts. "" when there is nothing to read — which the caller must render as unknown.
-func claudeBilledToModel() string {
-	var newestAt, model string
+// attributionWindow is how recent traffic must be to count as "now".
+//
+// The badge answers「当前计费」, and "current" without a time bound is a claim the data cannot
+// back: the old logic took the single newest assistant row REGARDLESS of age, so a GLM session
+// from three days ago kept asserting「记在 GLM 名下」over an idle weekend. Outside the window
+// there is no "now" to describe, and the honest display is no badge at all.
+const attributionWindow = 30 * time.Minute
+
+// recentClaudeVendors returns the set of vendors with assistant traffic inside the window, keyed
+// by vendor id, plus the ids of models no vendor table claims (rare, but the user recognises the
+// raw id and it must not be swallowed).
+//
+// It reads the newest transcripts' tails and keeps only rows whose timestamp falls inside the
+// window — mtime alone would lie, since a compaction or a metadata append touches the file
+// without producing billable traffic.
+func recentClaudeVendors(now time.Time) map[string]string {
+	vendors := map[string]string{}
+	cutoff := now.Add(-attributionWindow).UTC().Format(time.RFC3339)
 	for _, path := range transcript.NewestFiles(claudeProjectsDir(), "", transcript.JSONLSuffix, claudeAttributionFiles) {
 		needle := []byte(`"assistant"`)
 		_ = transcript.ScanTail(path, transcript.DefaultTailBytes, func(line []byte) bool {
@@ -153,30 +227,58 @@ func claudeBilledToModel() string {
 			if json.Unmarshal(line, &row) != nil || row.Type != "assistant" || row.Message.Model == "" {
 				return true
 			}
-			if row.Timestamp > newestAt {
-				newestAt, model = row.Timestamp, row.Message.Model
+			if row.Timestamp < cutoff {
+				return true // real traffic, but not current — see attributionWindow
+			}
+			if vendor := pricing.VendorForModel(row.Message.Model); vendor.ID != "" {
+				vendors[vendor.ID] = row.Message.Model
+			} else {
+				vendors[""] = row.Message.Model
 			}
 			return true
 		})
 	}
-	return model
+	return vendors
 }
 
 // claudeAttribution answers "is the traffic Claude Code is producing right now billed to THIS
 // account?" for any claude-runtime account (Anthropic's own, or a Coding Plan behind it).
-// nil when nothing has been recorded yet — unknown is never rendered as no.
+//
+// nil when there has been no claude traffic inside the window — unknown is never rendered as no,
+// and stale is never rendered as current.
+//
+// CONCURRENCY is the case this used to get wrong: several panes can be live at once, split across
+// vendors (measured on this host: 131 GLM rows and 2 Anthropic rows in one hour). Taking the
+// single newest row picked one of them and called it THE biller, a claim that flipped by the
+// second and was false the whole time. Now each account whose vendor has traffic in the window
+// says 当前计费 for itself, and the「记在 X 名下」cross-badge is claimed only when exactly one
+// vendor is active — the one unambiguous case where naming it is information rather than a guess.
 func claudeAttribution(account Account) *Attribution {
-	model := claudeBilledToModel()
-	if model == "" {
+	vendors := recentClaudeVendors(time.Now())
+	if len(vendors) == 0 {
 		return nil
 	}
-	vendor := pricing.VendorForModel(model)
-	attribution := &Attribution{Active: vendor.ID == account.Vendor, Vendor: vendor.ID}
-	if vendor.ID != "" {
-		attribution.Display = Account{Runtime: account.Runtime, Vendor: vendor.ID}.Display()
-	} else {
-		// Nobody's model table claims this id. Name the id — it is what the user will recognise.
-		attribution.ProviderID = model
+	return attributionFromVendors(account, vendors)
+}
+
+// attributionFromVendors is the shared set→badge rule for both runtimes. See claudeAttribution
+// for why the cross-vendor name is published only when the set has exactly one member.
+func attributionFromVendors(account Account, vendors map[string]string) *Attribution {
+	attribution := &Attribution{Active: false}
+	if _, ok := vendors[account.Vendor]; ok && account.Vendor != "" {
+		attribution.Active = true
+	}
+	if len(vendors) == 1 {
+		for vendor, model := range vendors {
+			if vendor == "" {
+				// Nobody's model table claims this id. Name the id — it is what the user will
+				// recognise.
+				attribution.ProviderID = model
+				continue
+			}
+			attribution.Vendor = vendor
+			attribution.Display = Account{Runtime: account.Runtime, Vendor: vendor}.Display()
+		}
 	}
 	return attribution
 }
