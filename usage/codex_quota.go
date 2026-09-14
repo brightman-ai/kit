@@ -98,17 +98,46 @@ type codexSessionMeta struct {
 }
 
 // codexBilledToProvider returns the runtime-side provider id of the NEWEST codex session on this
-// host — i.e. who the traffic being produced right now is billed to. "" when there are no
-// sessions, or when the rollout predates the field (which by definition means OpenAI itself).
-//
-// This is one line of one file, so every account may ask it freely; it is the single source for
-// the "is this account the one currently being billed?" question that both codex accounts need.
+// host. Retained for callers that genuinely want the newest session's endpoint; attribution uses
+// the windowed set below, because "newest" under concurrency names one of several live billers
+// and claims it is the only one.
 func codexBilledToProvider() string {
 	files := transcript.NewestFiles(codexSessionsDir(), transcript.RolloutPrefix, transcript.JSONLSuffix, 1)
 	if len(files) == 0 {
 		return ""
 	}
 	return rolloutProvider(files[0])
+}
+
+// codexAttributionFiles bounds how many rollouts the windowed attribution scan opens. Only the
+// first line of each is read (session_meta), so the cost is one open+read per file.
+const codexAttributionFiles = 24
+
+// recentCodexVendors returns the set of vendors with an ACTIVE codex rollout inside the window,
+// keyed by vendor id; provider ids nobody claims map to "" with the raw id as the value, so an
+// undeclared relay stays visible instead of being silently dropped.
+//
+// A rollout's provider is fixed at session start, so file recency is the session's recency:
+// mtime inside the window ⟹ this endpoint was talking within the last half hour.
+func recentCodexVendors(now time.Time) map[string]string {
+	vendors := map[string]string{}
+	for _, path := range transcript.NewestFiles(codexSessionsDir(), transcript.RolloutPrefix, transcript.JSONLSuffix, codexAttributionFiles) {
+		fi, err := os.Stat(path)
+		if err != nil || now.Sub(fi.ModTime()) > attributionWindow {
+			continue
+		}
+		provider := rolloutProvider(path)
+		if provider == "" || provider == codexOwnProvider {
+			vendors[VendorOpenAI] = provider
+			continue
+		}
+		if id := vendorForRuntimeProvider(provider); id != "" {
+			vendors[id] = provider
+		} else {
+			vendors[""] = provider
+		}
+	}
+	return vendors
 }
 
 // codexRolloutScan walks recent rollouts newest-first and returns the newest ACCOUNT reading per

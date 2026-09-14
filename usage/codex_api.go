@@ -150,7 +150,7 @@ func probeCodexQuota(ctx context.Context) error {
 	// minutes to hours, and a fresh window legitimately has nothing yet. Never let that failure
 	// discard the windows we just fetched.
 	_, prior := readSnapshotReadings(snap.Account)
-	if credits, err := codexCredits(ctx, token, accountID, usage.RateLimit.PrimaryWindow, prior); err == nil {
+	if credits, err := codexCredits(ctx, token, accountID, usage.RateLimit.PrimaryWindow, prior, snap.Account, time.Now()); err == nil {
 		snap.Credits = credits
 	} else if prior != nil {
 		// The daily ledger is unavailable, but what the previous window spent is a settled fact
@@ -158,6 +158,7 @@ func probeCodexQuota(ctx context.Context) error {
 		// going blank; the current window's spend is simply absent, which is true.
 		snap.Credits = &Credits{
 			Source: prior.Source, PriorWindow: prior.PriorWindow, PriorWindowStart: prior.PriorWindowStart,
+			PriorIsCycle: prior.PriorIsCycle,
 		}
 	}
 	return writeSnapshot(snap)
@@ -188,39 +189,84 @@ func mustWindow(w *codexRateWindow) *QuotaWindow {
 // ── credits ──────────────────────────────────────────────────────────────────
 
 type codexDailyJSON struct {
-	Data []struct {
-		Date   string `json:"date"`
-		Totals struct {
-			Credits float64 `json:"credits"`
-			Turns   float64 `json:"turns"`
-		} `json:"totals"`
-	} `json:"data"`
+	Data []codexDailyRow `json:"data"`
 }
 
-// codexCredits sums the account's spend across the days the CURRENT window covers, and the same
-// again for the window before it.
+// codexDailyRow is one calendar day of the vendor's ledger.
+type codexDailyRow struct {
+	Date   string `json:"date"`
+	Totals struct {
+		Credits float64 `json:"credits"`
+		Turns   float64 `json:"turns"`
+	} `json:"totals"`
+}
+
+// settled reports whether this row can be read as a FINAL figure.
 //
-// It no longer derives a budget from the percentage. See the Credits type comment: two measured
-// windows put credits-per-percentage-point at 630.2 and 166.9, so the proportionality that
-// derivation rests on does not hold, and the answer it produced was off by 3.78×.
+// Two tests, both using only what the vendor itself put in the row — no timers, no thresholds,
+// nothing to tune:
+//
+//  1. Today's row is never final. The vendor is still writing it.
+//  2. A row with spend but ZERO turns is self-contradictory, and that is the ledger caught
+//     mid-write. Measured 2026-09-05: every settled day sat between 179 and 218 credits per
+//     turn, while that day read 1,153.45 credits against 0 turns after seven hours of heavy
+//     use — the account's rate-limit meter moved 65% → 71% → 74% across the same span and the
+//     credits figure did not change by so much as its sixth decimal.
+//
+// Why this matters more than it looks: without the concept, `Used` silently mixes settled history
+// with a day the vendor has not written yet, and a window that is ONE day old — exactly the state
+// right after a reset — is then 100% unsettled while presenting itself as "spent this cycle".
+func (r codexDailyRow) settled(today string) bool {
+	if r.Date >= today {
+		return false
+	}
+	return !(r.Totals.Credits > 0 && r.Totals.Turns == 0)
+}
+
+// codexCredits reports what the CURRENT cycle has cost, how much of that the vendor has actually
+// settled, and — separately, and labelled as such — what the span before it cost.
+//
+// Three things it deliberately does NOT do, each because doing it produced a wrong number that
+// looked right:
+//
+//   - It does not derive a budget from the percentage. Credits and the rate-limit meter are
+//     separate meters: measured credits-per-percentage-point came out 630.2, 166.9 and 16.2 on
+//     one account. See the Credits type comment.
+//   - It does not present unsettled days as spend. The vendor writes today's row late — measured
+//     2026-09-05, seven hours of heavy use and the meter climbing 65→74% while the row sat at
+//     1,153.45 credits / 0 turns. A window one day old is then entirely unsettled, and saying
+//     "本周期已耗 1.2k" of it is a fabrication with a decimal point.
+//   - It does not call a rolling span "the previous cycle". A cycle that ended EARLY (codex sells
+//     a reset card for exactly this) is shorter than a span, so counting one span back from the
+//     current cycle's start reaches into the cycle before it. The span is still reported — it
+//     answers "what does a week of my work cost" — but PriorIsCycle says whether it is a cycle,
+//     and that is true only when the boundary was OBSERVED (see cycle.go).
 //
 // The sum is by calendar day because that is the only grain the endpoint offers, so a window that
 // opened mid-day includes some spend from before it opened. That is reported as an over-count
-// (WholeDays) rather than silently corrected: guessing an intra-day split would replace a known
-// bias with an unknown one.
-func codexCredits(ctx context.Context, token, accountID string, window *codexWindowJSON, prior *Credits) (*Credits, error) {
+// (WholeDays) rather than silently corrected.
+func codexCredits(ctx context.Context, token, accountID string, window *codexWindowJSON, prior *Credits, acct Account, now time.Time) (*Credits, error) {
 	if window == nil || window.LimitWindowSeconds <= 0 || window.ResetAt <= 0 {
 		return nil, errors.New("codex: 无周窗口，无法归集 credits")
 	}
-	span := int64(window.LimitWindowSeconds)
-	start := time.Unix(window.ResetAt-span, 0)
-	// One window further back, so a brand-new window can still say something about the budget:
-	// whatever the previous window spent, the budget is at least that.
-	priorStart := time.Unix(window.ResetAt-2*span, 0)
-	today := time.Now()
+	span := time.Duration(window.LimitWindowSeconds) * time.Second
+	end := time.Unix(window.ResetAt, 0)
+	// The CURRENT cycle's start is sound arithmetic: however a cycle begins — natural rollover or
+	// a redeemed reset card — it then runs a full span. Only the PREVIOUS cycle's start is
+	// unknowable, and that one is looked up rather than computed.
+	start := end.Add(-span)
+
+	led := observeCycleBoundary(acct, end, now)
+	priorStart, priorEnd, priorObserved := led.priorCycle(end)
+	if !priorObserved {
+		// Not observed ⟹ report the span before this cycle for what it is: a rolling window, not
+		// a cycle. Substituting it for a cycle is the defect this whole file now documents.
+		priorStart, priorEnd = start.Add(-span), start
+	}
+
 	query := url.Values{
 		"start_date":     {priorStart.Format(time.DateOnly)},
-		"end_date":       {today.AddDate(0, 0, 1).Format(time.DateOnly)},
+		"end_date":       {now.AddDate(0, 0, 1).Format(time.DateOnly)},
 		"group_by":       {"day"},
 		"workspace_user": {"true"},
 	}
@@ -229,25 +275,40 @@ func codexCredits(ctx context.Context, token, accountID string, window *codexWin
 		return nil, err
 	}
 
-	startDay, endDay := start.Format(time.DateOnly), today.Format(time.DateOnly)
-	priorStartDay := priorStart.Format(time.DateOnly)
-	credits := &Credits{Source: CreditsSourceAPI, WindowStart: start.UTC().Format(time.RFC3339)}
+	today := now.Format(time.DateOnly)
+	startDay, endDay := start.Format(time.DateOnly), today
+	priorStartDay, priorEndDay := priorStart.Format(time.DateOnly), priorEnd.Format(time.DateOnly)
+
+	credits := &Credits{
+		Source:       CreditsSourceAPI,
+		WindowStart:  start.UTC().Format(time.RFC3339),
+		PriorIsCycle: priorObserved,
+	}
 	var priorUsed float64
 	for _, row := range daily.Data {
 		switch {
 		case row.Date >= startDay && row.Date <= endDay:
 			credits.Used += row.Totals.Credits
 			credits.Days++
-		case row.Date >= priorStartDay && row.Date < startDay:
+			if row.settled(today) {
+				if row.Date > credits.SettledThrough {
+					credits.SettledThrough = row.Date
+				}
+			} else {
+				credits.UnsettledDays++
+			}
+		case row.Date >= priorStartDay && row.Date < priorEndDay:
 			priorUsed += row.Totals.Credits
 		}
 	}
 	credits.PriorWindow, credits.PriorWindowStart = priorUsed, priorStart.UTC().Format(time.RFC3339)
 	if credits.PriorWindow == 0 && prior != nil {
-		// The ledger returned nothing for the previous window — it has aged out of the queried
-		// range, or that window genuinely had no spend. Either way a figure we already measured is
-		// not made false by a later query not repeating it.
+		// The ledger returned nothing for the previous span — it has aged out of the queried
+		// range, or that span genuinely had no spend. Either way a figure we already measured is
+		// not made false by a later query not repeating it. Its provenance is carried with it:
+		// keeping the number while claiming a cycle we did not observe would launder a guess.
 		credits.PriorWindow, credits.PriorWindowStart = prior.PriorWindow, prior.PriorWindowStart
+		credits.PriorIsCycle = prior.PriorIsCycle
 	}
 	// The window opened mid-day ⟹ the first day's total includes spend from the previous
 	// window. Say so; do not quietly prorate.

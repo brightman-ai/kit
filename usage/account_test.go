@@ -359,3 +359,107 @@ func TestRegistry_OneRuntimeCanHoldTwoAccounts(t *testing.T) {
 		t.Fatalf("每个 runtime 都该能挂多个账号，实得 %v", byRuntime)
 	}
 }
+
+// 并发是归因最容易说错的情形，而且在这台机器上是真实发生的：一小时里 131 条 GLM 消息和
+// 2 条 Anthropic 消息同时流淌。旧逻辑取「最新一条」，等于从两个都在付费的厂商里挑一个、
+// 宣称它是唯一付款方 —— 每秒可能翻面，且全程为假。
+//
+// 新规则：窗口内有流量的账号各自标「当前计费」；「记在 X 名下」只在窗口内恰有一个厂商时
+// 才说 —— 唯一一种点名是信息而不是猜测的情形。
+func TestAttribution_ConcurrentVendorsAreBothBilledNoCrossClaim(t *testing.T) {
+	env := newQuotaEnv(t).withCodexAuth(t, false).withCLI(t, "codex")
+	withCredentials(t, fakeCredentials{
+		VendorMoonshot: {APIKey: "placeholder-not-a-key", RuntimeProviderIDs: []string{"mimo2codex-kimi-coding"}},
+	})
+	ownRollout(t, env, "25", "official-live", time.Now().Add(-5*time.Minute), 40)
+	proxiedRollout(t, env, "25", "kimi-live", "mimo2codex-kimi-coding", time.Now().Add(-1*time.Minute))
+
+	openai := (codexProvider{}).Query().Attribution
+	kimi := (kimiProvider{}).Query().Attribution
+	if openai == nil || kimi == nil {
+		t.Fatalf("两个厂商都在窗口内有活跃会话，归因不得为 nil：%+v / %+v", openai, kimi)
+	}
+	if !openai.Active || !kimi.Active {
+		t.Fatalf("并发时双方都应标当前计费（各付各的），got openai=%v kimi=%v", openai.Active, kimi.Active)
+	}
+	// 关键断言：谁也不许把对方指认为「唯一付款方」。流量是分开的，点名就是错的。
+	if openai.Vendor != "" || kimi.Vendor != "" {
+		t.Fatalf("并发时不得声称单一付款方：openai=%+v kimi=%+v", openai, kimi)
+	}
+}
+
+// 「当前计费」的"当前"必须有边界。旧逻辑取最新一条消息**不看年龄** —— 三天前的 GLM 会话能让
+// 徽标在整个空闲的周末坚称「记在 GLM 名下」。窗口之外没有"现在"可描述，诚实的显示是没有徽标。
+func TestAttribution_StaleTrafficClaimsNothing(t *testing.T) {
+	env := newQuotaEnv(t).withCodexAuth(t, false).withCLI(t, "codex")
+	// 两个会话都在窗口外：一个官方、一个中转。
+	ownRollout(t, env, "22", "official-old", time.Now().Add(-3*24*time.Hour), 40)
+	proxiedRollout(t, env, "22", "kimi-old", "mimo2codex-kimi-coding", time.Now().Add(-2*24*time.Hour))
+
+	if got := (codexProvider{}).Query().Attribution; got != nil {
+		t.Fatalf("窗口外无流量却仍宣称当前计费：%+v", got)
+	}
+	if got := (kimiProvider{}).Query().Attribution; got != nil {
+		t.Fatalf("同上（kimi 账号）：%+v", got)
+	}
+}
+
+// claude 侧同一条规则（判据不同：claude 靠 model id，因为没有端点记录）。
+// 同一时刻一个 glm 会话一个 opus 会话 → 两边都「当前计费」，互不指认。
+func TestClaudeAttribution_ConcurrentGlmAndAnthropic(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("DW_CLAUDE_PROJECTS", dir)
+	now := time.Now().UTC()
+	at := func(model string, ts time.Time) string {
+		return fmt.Sprintf(`{"type":"assistant","timestamp":%q,"message":{"id":"msg_%s","model":%q,"usage":{"input_tokens":1,"output_tokens":1}}}`,
+			ts.Format(time.RFC3339), model+"-"+ts.Format("150405"), model)
+	}
+	// 两个项目目录、两个并发会话：GLM 三分钟前，opus 一分钟前（更新）。
+	for _, proj := range []string{"proj-a", "proj-b"} {
+		if err := os.MkdirAll(filepath.Join(dir, proj), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(t, filepath.Join(dir, "proj-a", "glm-session.jsonl"),
+		at("glm-5.3", now.Add(-3*time.Minute))+"\n")
+	write(t, filepath.Join(dir, "proj-b", "opus-session.jsonl"),
+		at("claude-opus-5", now.Add(-1*time.Minute))+"\n")
+
+	anthropic := claudeAttribution(Account{Runtime: "claude", Vendor: VendorAnthropic})
+	zhipu := claudeAttribution(Account{Runtime: "claude", Vendor: VendorZhipu})
+	if anthropic == nil || zhipu == nil {
+		t.Fatalf("双方都有窗口内流量，got %+v / %+v", anthropic, zhipu)
+	}
+	if !anthropic.Active || !zhipu.Active {
+		t.Fatalf("并发时双方都应标当前计费，got anthropic=%v zhipu=%v", anthropic.Active, zhipu.Active)
+	}
+	if anthropic.Vendor != "" || zhipu.Vendor != "" {
+		t.Fatalf("并发时不得指认单一付款方：%+v / %+v", anthropic, zhipu)
+	}
+
+	// 单一厂商时，「记在 X 名下」要回来 —— 这是它唯一该出现的情形。
+	write(t, filepath.Join(dir, "proj-b", "opus-session.jsonl"),
+		at("glm-5.3", now.Add(-30*time.Second))+"\n")
+	onlyGlm := claudeAttribution(Account{Runtime: "claude", Vendor: VendorAnthropic})
+	if onlyGlm == nil || onlyGlm.Active {
+		t.Fatalf("官方账号未在计费，got %+v", onlyGlm)
+	}
+	if onlyGlm.Vendor != VendorZhipu || onlyGlm.Display != "GLM Coding Plan" {
+		t.Fatalf("单一厂商时应点名，got %+v", onlyGlm)
+	}
+}
+
+// claude 侧的过期同样不得宣称 —— 徽标写的是「当前」，不是「最近一次」。
+func TestClaudeAttribution_StaleClaimsNothing(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "p"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("DW_CLAUDE_PROJECTS", dir)
+	old := time.Now().UTC().Add(-48 * time.Hour)
+	write(t, filepath.Join(dir, "p", "old.jsonl"),
+		fmt.Sprintf(`{"type":"assistant","timestamp":%q,"message":{"model":"glm-5.3"}}`+"\n", old.Format(time.RFC3339)))
+	if got := claudeAttribution(Account{Runtime: "claude", Vendor: VendorZhipu}); got != nil {
+		t.Fatalf("两天前的会话不得宣称当前计费：%+v", got)
+	}
+}

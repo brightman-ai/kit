@@ -213,7 +213,7 @@ func (p kimiProvider) Query() QuotaInfo {
 	// Same question, same single source as the OpenAI account asks: whose bill is the traffic
 	// being produced right now. Answering it per-account is what lets exactly one row say
 	// 「当前计费」 instead of both rows looking equally plausible.
-	info.Attribution = codexAttribution(account, codexBilledToProvider())
+	info.Attribution = codexAttribution(account)
 
 	readings, _ := readSnapshotReadings(account)
 	if len(readings) == 0 {
