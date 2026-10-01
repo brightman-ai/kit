@@ -123,7 +123,11 @@ type RuntimeHealth struct {
 type QuotaGroup struct {
 	Family string `json:"family,omitempty"`
 	// FamilyLabel is what to render; Family stays the merge key.
-	FamilyLabel string        `json:"family_label,omitempty"`
+	FamilyLabel string `json:"family_label,omitempty"`
+	// AccountWide marks the family that IS the account's quota (vs a per-model or additional
+	// metered pool). Consumers use it to tell "a parallel sub-budget" from "the account's
+	// current family switched" — supersession semantics apply only to account-wide families.
+	AccountWide bool         `json:"account_wide,omitempty"`
 	Windows     []QuotaWindow `json:"windows,omitempty"`
 	Snapshot    *SnapshotMeta `json:"snapshot,omitempty"`
 }
@@ -374,6 +378,7 @@ func quotaGroupFromReading(r *Reading) QuotaGroup {
 	return QuotaGroup{
 		Family:      r.Family,
 		FamilyLabel: r.FamilyLabel,
+		AccountWide: r.AccountWide,
 		Windows:     windows,
 		Snapshot:    newSnapshotMeta(r, windows),
 	}

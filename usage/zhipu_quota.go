@@ -155,7 +155,7 @@ func (p zhipuProvider) Probe(ctx context.Context) error {
 		Source:     SourceProbe,
 		Plan:       strings.ToLower(payload.Data.Level),
 		Billing:    BillingSubscription,
-		Families:   []snapshotFamily{{Family: zhipuPlanFamily, Windows: dedupeWindows(windows)}},
+		Families:   []snapshotFamily{{Family: zhipuPlanFamily, AccountWide: true, Windows: dedupeWindows(windows)}},
 	})
 }
 

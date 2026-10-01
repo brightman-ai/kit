@@ -39,6 +39,13 @@ func deepworkFile(name string) string {
 	return filepath.Join(home, ".deepwork", name)
 }
 
+// DeepworkFile is deepworkFile, exported for hosts that keep home-scoped state beside our
+// readings (the subscription credential store). Quota snapshots already live there because a
+// vendor account belongs to the machine's user, not to whichever server instance happens to be
+// running; credentials are the same kind of fact, and a per-DataDir copy was how one host came
+// to show subscriptions another host had never heard of.
+func DeepworkFile(name string) string { return deepworkFile(name) }
+
 func claudeCredentialsPath() string {
 	return filepath.Join(transcript.ClaudeHome(), ".credentials.json")
 }

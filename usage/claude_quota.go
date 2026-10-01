@@ -85,7 +85,9 @@ func claudeHookReading() *Reading {
 		return nil
 	}
 
-	r := &Reading{CapturedAt: at, Source: SourceHook, Billing: BillingSubscription}
+	// The hook reports the account's own 5h/7d windows — there is exactly one pool and no
+	// per-model families on this runtime, so the reading is account-wide by definition.
+	r := &Reading{CapturedAt: at, Source: SourceHook, Billing: BillingSubscription, AccountWide: true}
 	if rl.Source == "api" {
 		r.Billing = BillingAPI
 		return r

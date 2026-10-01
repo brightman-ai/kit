@@ -174,8 +174,13 @@ func codexRolloutScan() []*Reading {
 			Source:     SourceRollout,
 			Plan:       rl.PlanType,
 			Family:     rl.LimitID,
-			Billing:    BillingSubscription,
-			Windows:    codexWindows(rl.Primary, rl.Secondary),
+			// Rollout readings are account-level by construction (the scanner keeps only
+			// account limit ids; per-model sub-limits are filtered out), so they always speak
+			// for the account pool — including a plan switch ("premium") that must supersede
+			// the previous account family.
+			AccountWide: true,
+			Billing:     BillingSubscription,
+			Windows:     codexWindows(rl.Primary, rl.Secondary),
 		})
 	}
 	return newestReadingsByFamily(readings...)

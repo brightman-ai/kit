@@ -55,6 +55,15 @@ type Reading struct {
 	Family string
 	// FamilyLabel is the family's human name, when the vendor gives one distinct from its id.
 	FamilyLabel string
+	// AccountWide says this family IS the account's own quota — not a per-model feature or an
+	// additional metered pool riding beside it. It decides projection order: groups[0] (what
+	// QuotaInfo.Family and the UI's "current family" read) must be an account-wide family when
+	// one exists, because the account pool is THE quota a user manages their week around. The
+	// alphabetic tie-break that preceded this flag let "base_model_inference" — an untouched
+	// reserve pool reported in the same probe answer — outrank "codex", the real account pool,
+	// every single time (observed 2026-09-30: card headline 100% while the account had 12%
+	// left and the pill said so).
+	AccountWide bool
 	Windows     []QuotaWindow
 }
 
@@ -81,8 +90,14 @@ func newestReading(readings ...*Reading) *Reading {
 // feature pool coexist with different windows, so a newer observation of one must never erase
 // the other. Time only resolves competing SOURCES within one family — which is why the probe
 // and the transcript must agree on family names; when they did not, the same window arrived
-// under two names and the two halves could never refresh each other. The returned slice is
-// newest-first so callers have a deterministic compatibility projection.
+// under two names and the two halves could never refresh each other.
+//
+// Order: account-wide families first, then newest-first within each class. Groups[0] is what
+// the compatibility projection (and the UI's active-family logic) reads as "the account's
+// quota", and an account-wide pool IS that even when an additional metered pool was observed
+// more recently — they are parallel budgets, not competing claims on one truth. Within the
+// account-wide class the newest still wins, which is what keeps a genuine plan switch
+// (codex → premium) superseding the old family rather than sitting beside it.
 func newestReadingsByFamily(readings ...*Reading) []*Reading {
 	byFamily := make(map[string]*Reading)
 	for _, r := range readings {
@@ -100,6 +115,9 @@ func newestReadingsByFamily(readings ...*Reading) []*Reading {
 		out = append(out, r)
 	}
 	sort.Slice(out, func(i, j int) bool {
+		if out[i].AccountWide != out[j].AccountWide {
+			return out[i].AccountWide
+		}
 		if out[i].CapturedAt.Equal(out[j].CapturedAt) {
 			return out[i].Family < out[j].Family
 		}

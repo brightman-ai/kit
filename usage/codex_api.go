@@ -127,7 +127,7 @@ func probeCodexQuota(ctx context.Context) error {
 		Billing:    BillingSubscription,
 	}
 	if windows := codexJSONWindows(usage.RateLimit); len(windows) > 0 {
-		snap.Families = append(snap.Families, snapshotFamily{Family: codexAccountFamily, Windows: windows})
+		snap.Families = append(snap.Families, snapshotFamily{Family: codexAccountFamily, AccountWide: true, Windows: windows})
 	}
 	for _, extra := range usage.AdditionalRateLimits {
 		windows := codexJSONWindows(extra.RateLimit)
@@ -136,7 +136,9 @@ func probeCodexQuota(ctx context.Context) error {
 		}
 		snap.Families = append(snap.Families, snapshotFamily{
 			// Merge on the metered-feature id — the same string codex writes as limit_id — and
-			// show the vendor's own name for it.
+			// show the vendor's own name for it. NOT account-wide: the rate_limit slot above is
+			// the account pool; these are parallel metered budgets that must never outrank it
+			// in projection order.
 			Family:  orDefault(extra.MeteredFeature, extra.LimitName),
 			Label:   extra.LimitName,
 			Windows: windows,

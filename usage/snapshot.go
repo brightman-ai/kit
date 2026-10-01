@@ -24,8 +24,13 @@ type snapshotFamily struct {
 	// Label is what a person should read instead of the family id. Vendors name a metered
 	// feature twice — an id to merge on ("codex_bengalfox") and a name to show
 	// ("GPT-5.3-Codex-Spark") — and showing the id is how an internal key ends up in a UI.
-	Label   string        `json:"label,omitempty"`
-	Windows []QuotaWindow `json:"windows"`
+	Label string `json:"label,omitempty"`
+	// AccountWide persists the account-pool flag (see Reading.AccountWide) so a restart keeps
+	// the projection order without waiting for the next probe. Absent in snapshots written
+	// before the flag existed: those read as false until the warmer rewrites them (≤10 min),
+	// which restores at worst the pre-fix tie-break, never something worse.
+	AccountWide bool         `json:"account_wide,omitempty"`
+	Windows     []QuotaWindow `json:"windows"`
 }
 
 // quotaSnapshot is one probe result, whole. It stores every family the vendor reported in that
@@ -131,6 +136,7 @@ func readSnapshotReadings(a Account) ([]*Reading, *Credits) {
 			Plan:        snap.Plan,
 			Family:      family.Family,
 			FamilyLabel: family.Label,
+			AccountWide: family.AccountWide,
 			Billing:     orDefault(snap.Billing, BillingSubscription),
 			Windows:     family.Windows,
 		})

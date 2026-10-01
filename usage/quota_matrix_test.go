@@ -539,6 +539,71 @@ func TestQuota_SameFamilyKeepsOnlyItsNewestReading(t *testing.T) {
 	}
 }
 
+// The observed 2026-09-30 production bug: one probe answer carried the account pool ("codex",
+// 12% left) AND an additional metered pool ("base_model_inference"/gpt-reserve, untouched, 100%
+// left). Both families share the probe's capture time, and the alphabetic tie-break put
+// "base_model_inference" first — so the compatibility projection (and the active-family logic
+// the UI builds on it) crowned the untouched reserve as the account's quota and folded the REAL
+// account pool away as "superseded history". AccountWide now outranks both recency and the
+// alphabet in projection order, and the flag round-trips through the persisted snapshot.
+func TestQuota_AccountPoolOutranksAdditionalFamilyAtEqualCapture(t *testing.T) {
+	env := newQuotaEnv(t).withCodexAuth(t, false).withCLI(t, "codex")
+	reset := time.Now().Add(150 * time.Hour).UTC().Format(time.RFC3339)
+	env.withCodexSnapshot(t, time.Now(),
+		snapshotFamily{Family: "codex", AccountWide: true, Windows: []QuotaWindow{{
+			Kind: "7d", WindowMinutes: 10080, UsedPercent: 88, RemainingPercent: 12, ResetAt: reset,
+		}}},
+		snapshotFamily{Family: "base_model_inference", Label: "gpt-reserve", Windows: []QuotaWindow{{
+			Kind: "7d", WindowMinutes: 10080, UsedPercent: 0, RemainingPercent: 100, ResetAt: reset,
+		}}})
+
+	q := (codexProvider{}).Query()
+	if q.Family != "codex" {
+		t.Fatalf("the account pool must headline the projection, got family=%q", q.Family)
+	}
+	if len(q.QuotaGroups) != 2 || q.QuotaGroups[0].Family != "codex" {
+		t.Fatalf("groups[0] must be the account pool, got %+v", q.QuotaGroups)
+	}
+	if got := q.Windows[0].RemainingPercent; got != 12 {
+		t.Fatalf("headline remaining = %v, want 12 (the account pool, not the reserve's 100)", got)
+	}
+	if !q.QuotaGroups[0].AccountWide {
+		t.Fatalf("account_wide must survive the snapshot round-trip: %+v", q.QuotaGroups[0])
+	}
+	if q.QuotaGroups[1].AccountWide {
+		t.Fatalf("an additional metered pool must not claim to be the account pool: %+v", q.QuotaGroups[1])
+	}
+}
+
+// Recency still decides BETWEEN account-wide families — a genuine plan switch (codex →
+// premium, both observed through rollouts) must supersede the old account family, not sit
+// beside it as an equal. AccountWide is a class, not a rank freeze.
+func TestQuota_PlanSwitchStillSupersedes_OlderAccountFamily(t *testing.T) {
+	env := newQuotaEnv(t).withCodexAuth(t, false).withCLI(t, "codex")
+	dir := filepath.Join(env.codexHome, "sessions", "2026", "09", "30")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	reset := time.Now().Add(150 * time.Hour).Unix()
+	line := func(at time.Time, family string, used float64) string {
+		return fmt.Sprintf(
+			`{"timestamp":%q,"type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":%q,"limit_name":null,"plan_type":"pro","primary":{"used_percent":%v,"window_minutes":10080,"resets_at":%d}}}}`,
+			at.UTC().Format(time.RFC3339), family, used, reset)
+	}
+	older := time.Now().Add(-48 * time.Hour)
+	newer := time.Now().Add(-1 * time.Hour)
+	write(t, filepath.Join(dir, "rollout-2026-09-30T00-00-00-switch.jsonl"),
+		line(older, "codex", 50)+"\n"+line(newer, "premium", 5)+"\n")
+
+	q := (codexProvider{}).Query()
+	if q.Family != "premium" {
+		t.Fatalf("the newer account family must win the projection, got %q", q.Family)
+	}
+	if len(q.QuotaGroups) != 2 || q.QuotaGroups[0].Family != "premium" {
+		t.Fatalf("premium must lead, got %+v", q.QuotaGroups)
+	}
+}
+
 func TestCodexRollout_KeepsNewestObservationPerAccountFamily(t *testing.T) {
 	env := newQuotaEnv(t)
 	dir := filepath.Join(env.codexHome, "sessions", "2026", "07", "14")

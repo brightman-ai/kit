@@ -184,7 +184,7 @@ func (p kimiProvider) Probe(ctx context.Context) error {
 	if len(windows) == 0 {
 		return errors.New("kimi: 账号未返回可用额度窗口")
 	}
-	snap.Families = []snapshotFamily{{Family: kimiPlanFamily, Windows: dedupeWindows(windows)}}
+	snap.Families = []snapshotFamily{{Family: kimiPlanFamily, AccountWide: true, Windows: dedupeWindows(windows)}}
 	return writeSnapshot(snap)
 }
 
