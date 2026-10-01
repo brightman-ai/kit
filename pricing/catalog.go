@@ -13,7 +13,12 @@ import (
 // load-bearing, not bookkeeping: economic projections are cached per file and per ended day, and
 // pricingSnapshot keys that cache on this constant. Adding rules without bumping would leave 221
 // already-projected GLM requests reading「无价表」forever, while the catalog claimed to price them.
-const CatalogVersion = "2026-08-22.1"
+//
+// 2026-09-30.1: GPT-6 rate cards (gpt-6-astra / gpt-6-sol), standard + priority(Fast), with the
+// vendor's long-context bands. Same load-bearing rule: without this bump, the ~2,900 gpt-6-astra
+// requests already projected this week keep reading「无价表」and the Codex subscription row keeps
+// showing「—」no price.
+const CatalogVersion = "2026-09-30.1"
 const FastModeSourceURL = "https://developers.openai.com/codex/agent-configuration/speed"
 
 // catalogSnapshotDate is when the bulk of this catalog was last transcribed from upstream. A rule
@@ -376,6 +381,31 @@ func buildCatalogRules() []catalogRule {
 		{id: "openai.gpt-5.6-luna.priority.v1", models: []string{"gpt-5.6-luna"}, serviceTier: "priority", from: from2026,
 			price:       openAILongPrice(2, .2, 12),
 			creditsPerM: credits(25, 2.5, 150), sourceURL: openAIPricing},
+
+		// 2026-09-30: GPT-6 family, transcribed from the live pricing page the same day
+		// (verifiedAt below is that check). The vendor's own long-context split — short ≤272K /
+		// long >272K — lands exactly on openAILongPrice's 2×/2×/1.5× shape, both models.
+		// "priority" here is the tier the page now calls Fast (renamed 2026-07-30); its rates
+		// carry their own long band, which the flat legacy priority cards never had.
+		// No token-to-credits schedule is published for these models, so creditsPerM is
+		// omitted rather than guessed. Known catalog-wide gap, unchanged here: OpenAI
+		// publishes cache-write rates (astra $12.50/M, sol $2.50/M short) but NO OpenAI entry
+		// models them yet — pricing cache writes for gpt-6 alone would make its totals
+		// compositionally different from every other OpenAI model's.
+		{id: "openai.gpt-6-astra.standard.v1", models: []string{"gpt-6-astra"}, serviceTier: "standard", from: from2026,
+			price: openAILongPrice(10, 1, 50), sourceURL: openAIModels + "gpt-6-astra",
+			verifiedAt: mustDate("2026-09-30")},
+		{id: "openai.gpt-6-astra.priority.v1", models: []string{"gpt-6-astra"}, serviceTier: "priority", from: from2026,
+			price: ModelPrice{Tier: Tier{InputPerM: 20, CacheReadPerM: 2, OutputPerM: 100}, Currency: "USD",
+				ContextThreshold: 272_000, Above: &Tier{InputPerM: 40, CacheReadPerM: 4, OutputPerM: 150}},
+			sourceURL: openAIPricing, verifiedAt: mustDate("2026-09-30")},
+		{id: "openai.gpt-6-sol.standard.v1", models: []string{"gpt-6-sol"}, serviceTier: "standard", from: from2026,
+			price: openAILongPrice(2, .2, 10), sourceURL: openAIModels + "gpt-6-sol",
+			verifiedAt: mustDate("2026-09-30")},
+		{id: "openai.gpt-6-sol.priority.v1", models: []string{"gpt-6-sol"}, serviceTier: "priority", from: from2026,
+			price: ModelPrice{Tier: Tier{InputPerM: 4, CacheReadPerM: .4, OutputPerM: 20}, Currency: "USD",
+				ContextThreshold: 272_000, Above: &Tier{InputPerM: 8, CacheReadPerM: .8, OutputPerM: 30}},
+			sourceURL: openAIPricing, verifiedAt: mustDate("2026-09-30")},
 
 		{id: "anthropic.claude-sonnet-5.promo.v1", models: []string{"claude-sonnet-5"}, serviceTier: "standard", from: from2026, until: &sonnetPromoEnd,
 			price: ModelPrice{Tier: Tier{InputPerM: 2, CacheReadPerM: .2, OutputPerM: 10, CacheWrite5mPerM: 2.5, CacheWrite1hPerM: 4}, Currency: "USD"}, sourceURL: claudePricing},

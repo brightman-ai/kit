@@ -150,3 +150,41 @@ func TestCatalogLongContextIsPerRequestNotDailyAggregate(t *testing.T) {
 		t.Fatalf("small requests were aggregated into long context: %v", manySmall)
 	}
 }
+
+// 2026-09-30: the GPT-6 cards, pinned the day they were transcribed. The numbers are the
+// vendor's own page (short ≤272K / long >272K), not derivable from any neighbor model — a
+// regression here is a wrong bill, which is worse than no bill.
+func TestCatalogGPT6FamilyExactRates(t *testing.T) {
+	c := DefaultCatalog()
+	astra, ok := c.Quote(RequestQuery{Model: "gpt-6-astra", At: atDate("2026-09-28"), ServiceTier: "default"})
+	if !ok {
+		t.Fatal("gpt-6-astra standard quote missing")
+	}
+	if astra.Price.InputPerM != 10 || astra.Price.CacheReadPerM != 1 || astra.Price.OutputPerM != 50 {
+		t.Fatalf("astra short rates wrong: %+v", astra.Price.Tier)
+	}
+	if astra.Price.Above == nil || astra.Price.Above.InputPerM != 20 || astra.Price.Above.CacheReadPerM != 2 || astra.Price.Above.OutputPerM != 75 {
+		t.Fatalf("astra long band wrong: %+v", astra.Price.Above)
+	}
+	if astra.Price.ContextThreshold != 272_000 {
+		t.Fatalf("astra threshold = %d, want 272000", astra.Price.ContextThreshold)
+	}
+	// No credits schedule is published for these models; absence must stay absence.
+	if _, hasCredits := astra.Credits(Usage{Input: 1, Output: 1}); hasCredits {
+		t.Fatal("gpt-6-astra must not carry an invented credits schedule")
+	}
+	sol, ok := c.Quote(RequestQuery{Model: "gpt-6-sol", At: atDate("2026-09-28"), ServiceTier: "default"})
+	if !ok || sol.Price.InputPerM != 2 || sol.Price.CacheReadPerM != .2 || sol.Price.OutputPerM != 10 {
+		t.Fatalf("gpt-6-sol standard rates wrong: ok=%v %+v", ok, sol.Price.Tier)
+	}
+	if sol.Price.Above == nil || sol.Price.Above.OutputPerM != 15 {
+		t.Fatalf("gpt-6-sol long band wrong: %+v", sol.Price.Above)
+	}
+	astraFast, ok := c.Quote(RequestQuery{Model: "gpt-6-astra", At: atDate("2026-09-28"), ServiceTier: "priority"})
+	if !ok || astraFast.Price.OutputPerM != 100 || astraFast.Price.Above == nil || astraFast.Price.Above.OutputPerM != 150 {
+		t.Fatalf("gpt-6-astra priority(Fast) rates wrong: ok=%v %+v above=%+v", ok, astraFast.Price.Tier, astraFast.Price.Above)
+	}
+	if astra.VerifiedAt != atDate("2026-09-30") {
+		t.Fatalf("verifiedAt = %v, want the 2026-09-30 transcription check", astra.VerifiedAt)
+	}
+}
