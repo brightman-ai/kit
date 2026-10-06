@@ -407,6 +407,20 @@ func buildCatalogRules() []catalogRule {
 				ContextThreshold: 272_000, Above: &Tier{InputPerM: 8, CacheReadPerM: .8, OutputPerM: 30}},
 			sourceURL: openAIPricing, verifiedAt: mustDate("2026-09-30")},
 
+		// gpt-6.1-sol: card landed 2026-10-06 after two weeks of live codex traffic read as
+		// unpriced (priced 1/7048 on the reference machine) — tokens showed, money didn't.
+		// Vendor model page the same day: $2 in / $0.10 cached (5% of input — unlike
+		// gpt-6-sol's 10%) / $10 out per M, >272K at 2× in and cache / 1.5× out; the 2× tier
+		// is what this catalog files under priority. Like the rest of the GPT-6 generation,
+		// no credits schedule is published — omitted rather than extrapolated.
+		{id: "openai.gpt-6.1-sol.standard.v1", models: []string{"gpt-6.1-sol"}, serviceTier: "standard", from: from2026,
+			price: openAILongPrice(2, .1, 10), sourceURL: openAIModels + "gpt-6.1-sol",
+			verifiedAt: mustDate("2026-10-06")},
+		{id: "openai.gpt-6.1-sol.priority.v1", models: []string{"gpt-6.1-sol"}, serviceTier: "priority", from: from2026,
+			price: ModelPrice{Tier: Tier{InputPerM: 4, CacheReadPerM: .2, OutputPerM: 20}, Currency: "USD",
+				ContextThreshold: 272_000, Above: &Tier{InputPerM: 8, CacheReadPerM: .4, OutputPerM: 30}},
+			sourceURL: openAIPricing, verifiedAt: mustDate("2026-10-06")},
+
 		{id: "anthropic.claude-sonnet-5.promo.v1", models: []string{"claude-sonnet-5"}, serviceTier: "standard", from: from2026, until: &sonnetPromoEnd,
 			price: ModelPrice{Tier: Tier{InputPerM: 2, CacheReadPerM: .2, OutputPerM: 10, CacheWrite5mPerM: 2.5, CacheWrite1hPerM: 4}, Currency: "USD"}, sourceURL: claudePricing},
 		{id: "anthropic.claude-sonnet-5.standard.v1", models: []string{"claude-sonnet-5"}, serviceTier: "standard", from: sonnetPromoEnd,

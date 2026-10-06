@@ -188,3 +188,32 @@ func TestCatalogGPT6FamilyExactRates(t *testing.T) {
 		t.Fatalf("verifiedAt = %v, want the 2026-09-30 transcription check", astra.VerifiedAt)
 	}
 }
+
+// gpt-6.1-sol carried two weeks of live codex traffic with no card (priced 1/7048,
+// 2026-10-06) — the fee section computed tokens fine and money not at all. These pin the
+// vendor's page: $2/$0.10/$10, cached at 5% of input, >272K at 2×/2×/1.5×, priority 2×.
+func TestCatalogGpt61SolCovered(t *testing.T) {
+	c := DefaultCatalog()
+	std, ok := c.Quote(RequestQuery{Model: "gpt-6.1-sol", At: atDate("2026-10-06"), ServiceTier: "default", Effort: "low"})
+	if !ok || std.Price.InputPerM != 2 || std.Price.CacheReadPerM != .1 || std.Price.OutputPerM != 10 {
+		t.Fatalf("standard quote=%+v ok=%v", std.Price, ok)
+	}
+	pri, ok := c.Quote(RequestQuery{Model: "gpt-6.1-sol", At: atDate("2026-10-06"), ServiceTier: "priority"})
+	if !ok || pri.Price.InputPerM != 4 || pri.Price.CacheReadPerM != .2 || pri.Price.OutputPerM != 20 {
+		t.Fatalf("priority quote=%+v ok=%v", pri.Price, ok)
+	}
+	// Long-context premium applies per request past 272K input: 2× in and cache, 1.5× out.
+	base, _ := std.Cost(Usage{Input: 272_000, CacheRead: 0, Output: 1_000})
+	premium, _ := std.Cost(Usage{Input: 272_001, CacheRead: 0, Output: 1_000})
+	if base >= premium {
+		t.Fatalf("272K premium not applied: base=%v premium=%v", base, premium)
+	}
+	wantBase := 272_000.0/1e6*2 + 1_000.0/1e6*10
+	if math.Abs(base-wantBase) > 1e-9 {
+		t.Fatalf("base=%v, want %v", base, wantBase)
+	}
+	// No credits schedule is published for the GPT-6 generation — absence must stay absence.
+	if _, hasCredits := std.Credits(Usage{Input: 1_000_000, CacheRead: 1_000_000, Output: 1_000_000}); hasCredits {
+		t.Fatal("gpt-6.1-sol must not carry an invented credits schedule")
+	}
+}
