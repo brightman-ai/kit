@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/brightman-ai/kit/pricing"
@@ -111,6 +112,10 @@ func claudeHookReading() *Reading {
 // ClaudeAPISession is one provider profile with a live-ish API-billing reading.
 type ClaudeAPISession struct {
 	Name string `json:"name"`
+	// Vendor is the party whose endpoint this profile routes to, as the host derived it
+	// from the profile's own base URL. Empty when the host knows of no mapping — the row
+	// then simply makes no vendor claim (it is billing-unknown, not pay-per-use).
+	Vendor string `json:"vendor,omitempty"`
 	// CapturedAt is RFC3339, the profile's last statusline beat.
 	CapturedAt string `json:"captured_at"`
 	// AgeSeconds is how long ago that beat was.
@@ -120,6 +125,30 @@ type ClaudeAPISession struct {
 // claudeAPISessionMaxAge bounds how long a profile file still counts as a live session —
 // statuslines beat every few seconds, so a day-old file is a session that has since closed.
 const claudeAPISessionMaxAge = 24 * time.Hour
+
+// Profile→vendor is HOST-owned knowledge: the host reads the profiles' base URLs and derives
+// which vendor each routes to (see DeriveVendorFromBaseURL). This package only consumes the
+// finished mapping — injected like UseCredentials — so a session row can name the party it
+// is billed to instead of every caller re-deriving it. Data, not code: an entry for a
+// profile that does not exist is inert, and nil clears the whole map.
+var (
+	profileVendorsMu sync.RWMutex
+	profileVendors   map[string]string
+)
+
+// SetProfileVendors installs the host's profile-name→vendor derivation.
+func SetProfileVendors(m map[string]string) {
+	profileVendorsMu.Lock()
+	defer profileVendorsMu.Unlock()
+	profileVendors = m
+}
+
+func profileVendor(name string) (string, bool) {
+	profileVendorsMu.RLock()
+	defer profileVendorsMu.RUnlock()
+	v, ok := profileVendors[name]
+	return v, ok
+}
 
 func claudeAPISessions(now time.Time) []ClaudeAPISession {
 	matches, err := filepath.Glob(deepworkFile("claude-rate-limits-*.json"))
@@ -147,7 +176,10 @@ func claudeAPISessions(now time.Time) []ClaudeAPISession {
 			name = strings.TrimSuffix(strings.TrimPrefix(base, "claude-rate-limits-"), ".json")
 		}
 		out = append(out, ClaudeAPISession{
-			Name:       name,
+			Name: name,
+			// A row with no host-declared mapping makes no vendor claim at all —
+			// billing-unknown beats a guessed 按量付费.
+			Vendor:     func() string { v, _ := profileVendor(name); return v }(),
 			CapturedAt: at.UTC().Format(time.RFC3339),
 			AgeSeconds: int64(now.Sub(at).Seconds()),
 		})

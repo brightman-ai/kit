@@ -90,13 +90,20 @@ type kimiWindowJSON struct {
 
 // window converts one slot into a unified window. ok=false when the payload does not describe a
 // usable ratio — a zero or unparseable limit is not "0% used", it is no reading at all.
+//
+// The vendor projects one ratio as `used` or as `remaining` and omits whichever side is
+// boring: an untouched account reports only limit+remaining (observed 2026-10-06), a used one
+// adds used. Used is read when present; otherwise used = limit − remaining. With neither
+// projection there is no reading, not a guess.
 func (w kimiWindowJSON) window(minutes int) (QuotaWindow, bool) {
-	limit, err1 := strconv.ParseFloat(strings.TrimSpace(w.Limit), 64)
-	used, err2 := strconv.ParseFloat(strings.TrimSpace(w.Used), 64)
-	if err1 != nil || err2 != nil || limit <= 0 {
+	limit, err := strconv.ParseFloat(strings.TrimSpace(w.Limit), 64)
+	if err != nil || limit <= 0 {
 		return QuotaWindow{}, false
 	}
-	percent := used / limit * 100
+	percent, ok := w.usedPercent(limit)
+	if !ok {
+		return QuotaWindow{}, false
+	}
 	if percent < 0 {
 		percent = 0
 	}
@@ -113,6 +120,18 @@ func (w kimiWindowJSON) window(minutes int) (QuotaWindow, bool) {
 		q.ResetAt = t.UTC().Format(time.RFC3339)
 	}
 	return q, true
+}
+
+// usedPercent reads the window's consumption as the vendor states it: explicit `used` when
+// the payload carries one, `limit − remaining` otherwise.
+func (w kimiWindowJSON) usedPercent(limit float64) (float64, bool) {
+	if used, err := strconv.ParseFloat(strings.TrimSpace(w.Used), 64); err == nil {
+		return used / limit * 100, true
+	}
+	if remaining, err := strconv.ParseFloat(strings.TrimSpace(w.Remaining), 64); err == nil {
+		return (limit - remaining) / limit * 100, true
+	}
+	return 0, false
 }
 
 // kimiMinutes normalises the vendor's {duration, timeUnit} pair into minutes. Unknown units
