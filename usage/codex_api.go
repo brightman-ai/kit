@@ -329,7 +329,7 @@ func codexGet(ctx context.Context, token, accountID, path string, out any) error
 	if accountID != "" {
 		req.Header.Set("ChatGPT-Account-Id", accountID)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := probeHTTPClient.Do(req)
 	if err != nil {
 		return err
 	}

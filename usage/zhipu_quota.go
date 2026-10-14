@@ -202,7 +202,7 @@ func zhipuGet(ctx context.Context, cred Credential, out any) error {
 	req.Header.Set("Authorization", "Bearer "+cred.APIKey)
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := probeHTTPClient.Do(req)
 	if err != nil {
 		return err
 	}
