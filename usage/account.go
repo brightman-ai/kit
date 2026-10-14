@@ -96,6 +96,18 @@ type Credential struct {
 	// code: proxy ids are user-chosen strings, so hardcoding one would be a guess that rots.
 	// Absent ⟹ we simply do not claim to know. Never inferred.
 	RuntimeProviderIDs []string `json:"runtime_provider_ids,omitempty"`
+	// OwnAccountProviderIDs lists the runtime-side provider ids that run on THIS credential's own
+	// account — not merely billed to its vendor. For codex signed in to ChatGPT under a custom
+	// provider id (say "local_codex") that is the same subscription, so the `rate_limits` codex
+	// records in-band are this account's limits and the quota scan may read them.
+	//
+	// It is separate from RuntimeProviderIDs on purpose: that field says whose bill a provider id
+	// lands on, and a relay declared as OpenAI is billed to OpenAI while still passing ANOTHER
+	// account's rate_limits through. Ownership needs stronger evidence than the vendor, so only a
+	// host that verified the id really is the user's own login should list it here. Meaningful
+	// for the OpenAI credential only; absent ⟹ only codex's own "openai" (or no) provider counts.
+	// Never inferred. Listing an id here does not map it to a vendor — that is RuntimeProviderIDs.
+	OwnAccountProviderIDs []string `json:"own_account_provider_ids,omitempty"`
 }
 
 // CredentialSource is the host's key store, injected by UseCredentials.
@@ -117,17 +129,30 @@ func UseCredentials(src CredentialSource) {
 	credentialsSrc = src
 }
 
-// credentialFor resolves one vendor's credential. ok=false when no source is installed or the
-// source holds nothing for this vendor — both mean "this account is not configured on this
-// host", which is a presence fact, not an error.
-func credentialFor(vendor string) (Credential, bool) {
+// declarationFor returns whatever the host declared for a vendor — a key, an endpoint mapping
+// (RuntimeProviderIDs), or both. ok=false when no source is installed or it holds nothing.
+//
+// Keyless declarations are real and common: an account reached through the runtime's own login
+// (codex signed in to ChatGPT) has no key for this package to hold, yet the host can still state
+// which runtime provider ids bill to it. A mapping needs only that statement; it is the probes
+// that call an API which need a key — see credentialFor. Conflating the two used to drop every
+// keyless mapping on the floor: the host declared "local_codex is my OpenAI subscription", and
+// nothing that maps a provider ever saw it.
+func declarationFor(vendor string) (Credential, bool) {
 	credentialsMu.RLock()
 	src := credentialsSrc
 	credentialsMu.RUnlock()
 	if src == nil {
 		return Credential{}, false
 	}
-	cred, ok := src.Credential(vendor)
+	return src.Credential(vendor)
+}
+
+// credentialFor resolves one vendor's credential for a call that authenticates with it. ok=false
+// when the host holds no KEY for this vendor — "this account cannot be probed from here", which
+// is a presence fact, not an error.
+func credentialFor(vendor string) (Credential, bool) {
+	cred, ok := declarationFor(vendor)
 	if !ok || cred.APIKey == "" {
 		return Credential{}, false
 	}
@@ -135,14 +160,15 @@ func credentialFor(vendor string) (Credential, bool) {
 }
 
 // vendorForRuntimeProvider maps a runtime-side provider id onto the vendor it bills, using only
-// what the host declared (see Credential.RuntimeProviderIDs). The empty string means "we do not
-// know", which the caller must render as unknown rather than as any particular vendor.
+// what the host declared (see Credential.RuntimeProviderIDs) — with or without a key. The empty
+// string means "we do not know", which the caller must render as unknown rather than as any
+// particular vendor.
 func vendorForRuntimeProvider(providerID string) string {
 	if providerID == "" {
 		return ""
 	}
 	for _, vendor := range attributionVendors {
-		cred, ok := credentialFor(vendor)
+		cred, ok := declarationFor(vendor)
 		if !ok {
 			continue
 		}

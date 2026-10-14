@@ -147,8 +147,8 @@ func codexRolloutScan() []*Reading {
 	byFamily := make(map[string]codexRateLimitObservation)
 
 	for _, path := range transcript.NewestFiles(root, transcript.RolloutPrefix, transcript.JSONLSuffix, codexScanFiles) {
-		if provider := rolloutProvider(path); provider != "" && provider != codexOwnProvider {
-			continue // somebody else's bill — its rate_limits are empty by construction
+		if !codexProviderBillsOwnAccount(rolloutProvider(path)) {
+			continue // somebody else's bill — its rate_limits are empty, or describe another account
 		}
 		for family, candidate := range scanCodexRateLimitsByFamily(path) {
 			current, exists := byFamily[family]
@@ -184,6 +184,34 @@ func codexRolloutScan() []*Reading {
 		})
 	}
 	return newestReadingsByFamily(readings...)
+}
+
+// codexProviderBillsOwnAccount says whether a rollout with this session_meta.model_provider ran
+// on the OpenAI account itself, so that its rate_limits are this account's limits.
+//
+// Codex's own id ("openai", or none on older rollouts) says so by itself. Any other id is a name
+// the user chose, and a name is not evidence — but the host can DECLARE it: codex signed in to
+// ChatGPT under a custom provider id (say "local_codex") is the same subscription, and the host
+// that verified that lists the id in the OpenAI credential's OwnAccountProviderIDs.
+//
+// Billing is not ownership, so RuntimeProviderIDs does not count: a relay declared as OpenAI is
+// billed to OpenAI yet may pass ANOTHER account's rate_limits through, and reading them would
+// overwrite this account's own reading with a stranger's. Without the ownership declaration the
+// id is somebody else's bill.
+func codexProviderBillsOwnAccount(provider string) bool {
+	if provider == "" || provider == codexOwnProvider {
+		return true
+	}
+	cred, ok := declarationFor(VendorOpenAI)
+	if !ok {
+		return false
+	}
+	for _, id := range cred.OwnAccountProviderIDs {
+		if id == provider {
+			return true
+		}
+	}
+	return false
 }
 
 // rolloutProvider reads session_meta (always the FIRST line) and returns the runtime-side

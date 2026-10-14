@@ -167,7 +167,9 @@ var attributionVendors = []string{VendorMoonshot, VendorZhipu, VendorOpenAI, Ven
 func AttributionRevision() string {
 	var b strings.Builder
 	for _, vendor := range attributionVendors {
-		cred, ok := credentialFor(vendor)
+		// Declarations, not credentials: the fingerprint covers exactly what
+		// vendorForRuntimeProvider maps with, keyless mappings included.
+		cred, ok := declarationFor(vendor)
 		if !ok || len(cred.RuntimeProviderIDs) == 0 {
 			continue
 		}

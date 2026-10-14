@@ -97,8 +97,13 @@ func snapshotPath(a Account) string {
 }
 
 // writeSnapshot persists a probe result so the OFFLINE path sees it too.
+//
+// It writes exactly what it is given. A successful probe builds a fresh snapshot, so it carries
+// no failure and thereby supersedes any older one; recordProbeFailure carries the old windows
+// forward and adds the failure. This used to clear the failure fields itself — which also
+// cleared them on recordProbeFailure's own write, so every failure was recorded as nothing and
+// the panel could only ever say "stale", never why.
 func writeSnapshot(snap quotaSnapshot) error {
-	snap.LastProbeAt, snap.LastProbeError = 0, "" // a successful capture supersedes any older failure
 	path := snapshotPath(snap.Account)
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
